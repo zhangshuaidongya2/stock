@@ -37,33 +37,23 @@ SINA_SPOT_URL = (
 )
 SYMBOL_CACHE_PATH = Path(__file__).with_name("stock_symbols_cache.json")
 
-# 默认运行参数；不传命令行参数时，会等同于：
-# .venv/bin/python stock_change_info.py --symbols 平安银行,巨力索具,贵州茅台 --history-days 5 --top 0 --format json --delay 0 --quote-source tencent --history-source sina --fund-flow
+# 命令行未传参时使用的默认配置。
 DEFAULT_RUN_CONFIG = {
-    # symbols: 指定要查询的股票。支持股票代码或名称，多个用逗号分隔。
-    # 示例：一次查询平安银行、巨力索具、贵州茅台。
-    # 使用中文名称时，脚本会先转换成股票代码，再请求行情接口。
+    # 要查询的股票（代码或名称，多个用逗号分隔）。
     "symbols": "002342",
-    # quote_source: 实时行情数据源。
-    # tencent=腾讯行情，适合指定股票代码，速度快；不等待东方财富失败。
-    # sina=新浪行情，适合全市场扫描或名称筛选，但可能慢或被限频。
-    # eastmoney=东方财富行情；auto=先东方财富，失败后按可用源兜底。
+    # 实时行情数据源：auto / eastmoney / tencent / sina。
     "quote_source": "tencent",
-    # history_source: 历史行情数据源。
-    # sina=新浪日线，不等待东方财富失败。
-    # eastmoney=东方财富历史行情；auto=先东方财富，失败后切新浪。
+    # 历史行情数据源：auto / eastmoney / sina。
     "history_source": "sina",
-    # history_days: 补充最近 N 个交易日历史摘要；0 表示不查询历史行情。
+    # 历史摘要天数；0 表示不查询历史行情。
     "history_days": 5,
-    # top: 最多输出多少只股票；0 表示不过滤数量，适合一次查询多只股票。
-    # 如果扫描全市场，可以改成 20、50 等数值限制输出数量。
+    # 输出条数上限；0 表示不过滤数量。
     "top": 0,
-    # output_format: 输出格式。可选 table、json、csv。
+    # 输出格式：table / json / csv。
     "output_format": "json",
-    # delay: 每只股票详情接口之间的等待秒数。
-    # 查询单只股票时用 0，加快执行；批量查询时可调大，降低限流概率。
+    # 个股详情请求间隔秒数。
     "delay": 0.0,
-    # fund_flow: 是否补充主力资金流入流出数据。该接口较慢，默认开启。
+    # 是否补充主力资金流数据。
     "fund_flow": True,
 }
 
@@ -945,7 +935,6 @@ def fetch_financial_indicator(ak: Any, code: str) -> dict[str, Any]:
 def fetch_fund_flow(ak: Any, code: str) -> dict[str, Any]:
     """获取个股主力资金流数据"""
     try:
-        # 确定市场
         normalized = normalize_code(code)
         if normalized.startswith("6"):
             market = "sh"
@@ -953,64 +942,77 @@ def fetch_fund_flow(ak: Any, code: str) -> dict[str, Any]:
             market = "bj"
         else:
             market = "sz"
-        
-        # 获取个股资金流
+
         fund_df = ak.stock_individual_fund_flow(stock=normalized, market=market)
         if fund_df is None or fund_df.empty:
             return {}
-        
-        # 获取最新一天的数据
+
         latest = fund_df.tail(1).iloc[0]
-        
-        # 尝试多种可能的列名
+
+        # 列名在不同接口版本下可能变化，按候选顺序匹配。
         result = {}
-        
-        # 主力净流入（单位：元，需要转换为万元）
+
+        # 净额字段单位为元，这里统一换算为万元。
         for col in ["主力净流入-净额", "主力净额", "主力净流入"]:
             if col in latest.index:
-                result["主力净流入(万)"] = round_or_none(safe_float(latest[col]) / 10000 if safe_float(latest[col]) is not None else None)
+                result["主力净流入(万)"] = round_or_none(
+                    safe_float(latest[col]) / 10000
+                    if safe_float(latest[col]) is not None
+                    else None
+                )
                 break
-        
-        # 主力净占比
+
         for col in ["主力净流入-净占比", "主力净占比", "主力占比"]:
             if col in latest.index:
                 result["主力净占比%"] = round_or_none(latest[col])
                 break
-        
-        # 超大单（单位：元，需要转换为万元）
+
         for col in ["超大单净流入-净额", "超大单净额", "超大单净流入"]:
             if col in latest.index:
-                result["超大单净流入(万)"] = round_or_none(safe_float(latest[col]) / 10000 if safe_float(latest[col]) is not None else None)
+                result["超大单净流入(万)"] = round_or_none(
+                    safe_float(latest[col]) / 10000
+                    if safe_float(latest[col]) is not None
+                    else None
+                )
                 break
-        
+
         for col in ["超大单净流入-净占比", "超大单净占比", "超大单占比"]:
             if col in latest.index:
                 result["超大单净占比%"] = round_or_none(latest[col])
                 break
-        
-        # 大单（单位：元，需要转换为万元）
+
         for col in ["大单净流入-净额", "大单净额", "大单净流入"]:
             if col in latest.index:
-                result["大单净流入(万)"] = round_or_none(safe_float(latest[col]) / 10000 if safe_float(latest[col]) is not None else None)
+                result["大单净流入(万)"] = round_or_none(
+                    safe_float(latest[col]) / 10000
+                    if safe_float(latest[col]) is not None
+                    else None
+                )
                 break
-        
+
         for col in ["大单净流入-净占比", "大单净占比", "大单占比"]:
             if col in latest.index:
                 result["大单净占比%"] = round_or_none(latest[col])
                 break
-        
-        # 中单（单位：元，需要转换为万元）
+
         for col in ["中单净流入-净额", "中单净额", "中单净流入"]:
             if col in latest.index:
-                result["中单净流入(万)"] = round_or_none(safe_float(latest[col]) / 10000 if safe_float(latest[col]) is not None else None)
+                result["中单净流入(万)"] = round_or_none(
+                    safe_float(latest[col]) / 10000
+                    if safe_float(latest[col]) is not None
+                    else None
+                )
                 break
-        
-        # 小单（单位：元，需要转换为万元）
+
         for col in ["小单净流入-净额", "小单净额", "小单净流入"]:
             if col in latest.index:
-                result["小单净流入(万)"] = round_or_none(safe_float(latest[col]) / 10000 if safe_float(latest[col]) is not None else None)
+                result["小单净流入(万)"] = round_or_none(
+                    safe_float(latest[col]) / 10000
+                    if safe_float(latest[col]) is not None
+                    else None
+                )
                 break
-        
+
         return result
     except Exception as exc:  # noqa: BLE001
         # 静默失败，不影响其他数据获取
