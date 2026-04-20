@@ -17,7 +17,7 @@ import argparse
 import json
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +35,7 @@ SINA_SPOT_URL = (
     "http://vip.stock.finance.sina.com.cn/quotes_service/api/"
     "json_v2.php/Market_Center.getHQNodeData"
 )
+EASTMONEY_FUND_FLOW_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
 SYMBOL_CACHE_PATH = Path(__file__).with_name("stock_symbols_cache.json")
 
 # 命令行未传参时使用的默认配置。
@@ -933,90 +934,180 @@ def fetch_financial_indicator(ak: Any, code: str) -> dict[str, Any]:
 
 
 def fetch_fund_flow(ak: Any, code: str) -> dict[str, Any]:
-    """获取个股主力资金流数据"""
+    """获取个股主力资金流数据，优先实时，失败回退到最近日线。"""
     try:
-        normalized = normalize_code(code)
-        if normalized.startswith("6"):
-            market = "sh"
-        elif normalized.startswith(("4", "8", "9")):
-            market = "bj"
-        else:
-            market = "sz"
+        realtime = fetch_fund_flow_realtime(code)
+        if realtime:
+            return realtime
+    except Exception:  # noqa: BLE001
+        pass
 
-        fund_df = ak.stock_individual_fund_flow(stock=normalized, market=market)
-        if fund_df is None or fund_df.empty:
-            return {}
+    try:
+        daily_fallback = fetch_fund_flow_daily(ak, code)
+        if daily_fallback:
+            return daily_fallback
+    except Exception:  # noqa: BLE001
+        pass
 
-        latest = fund_df.tail(1).iloc[0]
+    # 静默失败，不影响其他数据获取。
+    return {}
 
-        # 列名在不同接口版本下可能变化，按候选顺序匹配。
-        result = {}
 
-        # 净额字段单位为元，这里统一换算为万元。
-        for col in ["主力净流入-净额", "主力净额", "主力净流入"]:
-            if col in latest.index:
-                result["主力净流入(万)"] = round_or_none(
-                    safe_float(latest[col]) / 10000
-                    if safe_float(latest[col]) is not None
-                    else None
-                )
-                break
+def to_eastmoney_secid(code: str) -> str:
+    normalized = normalize_code(code)
+    # 东财 secid: 沪市=1，深市/北交所=0
+    market = "1" if normalized.startswith("6") else "0"
+    return f"{market}.{normalized}"
 
-        for col in ["主力净流入-净占比", "主力净占比", "主力占比"]:
-            if col in latest.index:
-                result["主力净占比%"] = round_or_none(latest[col])
-                break
 
-        for col in ["超大单净流入-净额", "超大单净额", "超大单净流入"]:
-            if col in latest.index:
-                result["超大单净流入(万)"] = round_or_none(
-                    safe_float(latest[col]) / 10000
-                    if safe_float(latest[col]) is not None
-                    else None
-                )
-                break
+def fetch_fund_flow_realtime(code: str) -> dict[str, Any]:
+    """实时资金流：东方财富分时接口（当日累计）。"""
+    import requests
 
-        for col in ["超大单净流入-净占比", "超大单净占比", "超大单占比"]:
-            if col in latest.index:
-                result["超大单净占比%"] = round_or_none(latest[col])
-                break
+    response = requests.get(
+        EASTMONEY_FUND_FLOW_URL,
+        params={
+            "secids": to_eastmoney_secid(code),
+            "fields": "f12,f14,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f124",
+            "ut": "b2884a393a59ad64002292a3e90d46a5",
+            "fltt": "2",
+            "invt": "2",
+            "np": "1",
+        },
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+            ),
+            "Referer": "https://quote.eastmoney.com/",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    diff = payload.get("data", {}).get("diff", [])
+    if not isinstance(diff, list) or not diff:
+        raise RuntimeError("东方财富实时资金流返回空数据")
 
-        for col in ["大单净流入-净额", "大单净额", "大单净流入"]:
-            if col in latest.index:
-                result["大单净流入(万)"] = round_or_none(
-                    safe_float(latest[col]) / 10000
-                    if safe_float(latest[col]) is not None
-                    else None
-                )
-                break
+    latest = diff[0]
+    result = {
+        "主力净流入(万)": scale_or_none(latest.get("f62"), 10000),
+        "主力净占比%": round_or_none(latest.get("f184")),
+        "超大单净流入(万)": scale_or_none(latest.get("f66"), 10000),
+        "超大单净占比%": round_or_none(latest.get("f69")),
+        "大单净流入(万)": scale_or_none(latest.get("f72"), 10000),
+        "大单净占比%": round_or_none(latest.get("f75")),
+        "中单净流入(万)": scale_or_none(latest.get("f78"), 10000),
+        "中单净占比%": round_or_none(latest.get("f81")),
+        "小单净流入(万)": scale_or_none(latest.get("f84"), 10000),
+        "小单净占比%": round_or_none(latest.get("f87")),
+        "资金流来源": "东方财富-实时",
+    }
 
-        for col in ["大单净流入-净占比", "大单净占比", "大单占比"]:
-            if col in latest.index:
-                result["大单净占比%"] = round_or_none(latest[col])
-                break
+    flow_time = safe_float(latest.get("f124"))
+    if flow_time is not None and flow_time > 0:
+        result["资金流时间"] = datetime.fromtimestamp(
+            int(flow_time),
+            tz=timezone.utc,
+        ).astimezone().isoformat()
 
-        for col in ["中单净流入-净额", "中单净额", "中单净流入"]:
-            if col in latest.index:
-                result["中单净流入(万)"] = round_or_none(
-                    safe_float(latest[col]) / 10000
-                    if safe_float(latest[col]) is not None
-                    else None
-                )
-                break
+    core_values = [
+        result.get("主力净流入(万)"),
+        result.get("超大单净流入(万)"),
+        result.get("大单净流入(万)"),
+        result.get("中单净流入(万)"),
+        result.get("小单净流入(万)"),
+    ]
+    if all(value is None for value in core_values):
+        raise RuntimeError("东方财富实时资金流字段为空")
+    return result
 
-        for col in ["小单净流入-净额", "小单净额", "小单净流入"]:
-            if col in latest.index:
-                result["小单净流入(万)"] = round_or_none(
-                    safe_float(latest[col]) / 10000
-                    if safe_float(latest[col]) is not None
-                    else None
-                )
-                break
 
-        return result
-    except Exception as exc:  # noqa: BLE001
-        # 静默失败，不影响其他数据获取
+def fetch_fund_flow_daily(ak: Any, code: str) -> dict[str, Any]:
+    """回退资金流：东方财富日线接口（最近交易日）。"""
+    normalized = normalize_code(code)
+    if normalized.startswith("6"):
+        market = "sh"
+    elif normalized.startswith(("4", "8", "9")):
+        market = "bj"
+    else:
+        market = "sz"
+
+    fund_df = ak.stock_individual_fund_flow(stock=normalized, market=market)
+    if fund_df is None or fund_df.empty:
         return {}
+
+    latest = fund_df.tail(1).iloc[0]
+
+    # 列名在不同接口版本下可能变化，按候选顺序匹配。
+    result = {
+        "资金流来源": "东方财富-日线(最近交易日)",
+    }
+    if "日期" in latest.index and latest["日期"] is not None:
+        result["资金流时间"] = str(latest["日期"])
+
+    # 净额字段单位为元，这里统一换算为万元。
+    for col in ["主力净流入-净额", "主力净额", "主力净流入"]:
+        if col in latest.index:
+            result["主力净流入(万)"] = round_or_none(
+                safe_float(latest[col]) / 10000
+                if safe_float(latest[col]) is not None
+                else None
+            )
+            break
+
+    for col in ["主力净流入-净占比", "主力净占比", "主力占比"]:
+        if col in latest.index:
+            result["主力净占比%"] = round_or_none(latest[col])
+            break
+
+    for col in ["超大单净流入-净额", "超大单净额", "超大单净流入"]:
+        if col in latest.index:
+            result["超大单净流入(万)"] = round_or_none(
+                safe_float(latest[col]) / 10000
+                if safe_float(latest[col]) is not None
+                else None
+            )
+            break
+
+    for col in ["超大单净流入-净占比", "超大单净占比", "超大单占比"]:
+        if col in latest.index:
+            result["超大单净占比%"] = round_or_none(latest[col])
+            break
+
+    for col in ["大单净流入-净额", "大单净额", "大单净流入"]:
+        if col in latest.index:
+            result["大单净流入(万)"] = round_or_none(
+                safe_float(latest[col]) / 10000
+                if safe_float(latest[col]) is not None
+                else None
+            )
+            break
+
+    for col in ["大单净流入-净占比", "大单净占比", "大单占比"]:
+        if col in latest.index:
+            result["大单净占比%"] = round_or_none(latest[col])
+            break
+
+    for col in ["中单净流入-净额", "中单净额", "中单净流入"]:
+        if col in latest.index:
+            result["中单净流入(万)"] = round_or_none(
+                safe_float(latest[col]) / 10000
+                if safe_float(latest[col]) is not None
+                else None
+            )
+            break
+
+    for col in ["小单净流入-净额", "小单净额", "小单净流入"]:
+        if col in latest.index:
+            result["小单净流入(万)"] = round_or_none(
+                safe_float(latest[col]) / 10000
+                if safe_float(latest[col]) is not None
+                else None
+            )
+            break
+
+    return result
 
 
 def to_records(df: Any) -> list[dict[str, Any]]:
