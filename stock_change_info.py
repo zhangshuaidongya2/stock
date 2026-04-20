@@ -26,6 +26,7 @@ pd = None
 
 
 REQUEST_TIMEOUT = 10
+FUND_FLOW_RETRY_TIMES = 2
 SINA_PAGE_SIZE = 80
 SINA_SPOT_COUNT_URL = (
     "http://vip.stock.finance.sina.com.cn/quotes_service/api/"
@@ -58,6 +59,14 @@ DEFAULT_RUN_CONFIG = {
     "fund_flow": True,
     # 主力资金流模式：realtime / daily / auto。
     "fund_flow_mode": "realtime",
+    # 是否计算支撑位/压力位。
+    "support_resistance": True,
+    # 支撑位/压力位分析回看天数。
+    "sr_days": 120,
+    # 支撑位/压力位返回层数。
+    "sr_levels": 3,
+    # 局部高低点识别窗口（交易日）。
+    "sr_pivot_window": 3,
 }
 
 
@@ -108,6 +117,8 @@ DEFAULT_TABLE_COLUMNS = [
     "历史来源",
     "历史区间",
     "历史天数",
+    "支撑位1",
+    "压力位1",
     "总市值(亿)",
 ]
 
@@ -217,6 +228,36 @@ def parse_args() -> argparse.Namespace:
             "资金流模式：realtime=仅实时(默认)；"
             "daily=仅最近交易日日线；auto=实时失败时回退日线。"
         ),
+    )
+    parser.add_argument(
+        "--support-resistance",
+        action="store_true",
+        default=DEFAULT_RUN_CONFIG["support_resistance"],
+        help="计算支撑位和压力位，默认开启。",
+    )
+    parser.add_argument(
+        "--no-support-resistance",
+        action="store_false",
+        dest="support_resistance",
+        help="不计算支撑位和压力位。",
+    )
+    parser.add_argument(
+        "--sr-days",
+        type=int,
+        default=DEFAULT_RUN_CONFIG["sr_days"],
+        help="支撑位/压力位分析回看天数，默认 120。",
+    )
+    parser.add_argument(
+        "--sr-levels",
+        type=int,
+        default=DEFAULT_RUN_CONFIG["sr_levels"],
+        help="返回多少层支撑位/压力位，默认 3。",
+    )
+    parser.add_argument(
+        "--sr-pivot-window",
+        type=int,
+        default=DEFAULT_RUN_CONFIG["sr_pivot_window"],
+        help="局部高低点识别窗口（交易日），默认 3。",
     )
     parser.add_argument(
         "--delay",
@@ -762,12 +803,21 @@ def fetch_history_summary(
     days: int,
     adjust: str,
     source: str = "auto",
+    include_sr: bool = False,
+    sr_days: int = 120,
+    sr_levels: int = 3,
+    sr_pivot_window: int = 3,
 ) -> dict[str, Any]:
-    if days <= 0:
+    need_summary = days > 0
+    need_sr = include_sr and sr_days > 0 and sr_levels > 0
+    if not need_summary and not need_sr:
         return {}
 
+    lookback_days = max(days if days > 0 else 0, sr_days if need_sr else 0)
     end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=max(40, days * 3))).strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=max(40, lookback_days * 3))).strftime(
+        "%Y%m%d"
+    )
     errors = []
 
     hist_df = None
@@ -807,41 +857,168 @@ def fetch_history_summary(
         if col in hist_df.columns:
             hist_df[col] = pd.to_numeric(hist_df[col], errors="coerce")
 
-    tail = hist_df.tail(days)
-    if tail.empty or "收盘" not in tail.columns:
+    summary = {}
+    if need_summary:
+        tail = hist_df.tail(days)
+        if not tail.empty and "收盘" in tail.columns:
+            first_close = safe_float(tail["收盘"].iloc[0])
+            last_close = safe_float(tail["收盘"].iloc[-1])
+            period_change = None
+            if first_close not in (None, 0) and last_close is not None:
+                period_change = (last_close / first_close - 1) * 100
+
+            highest = safe_float(tail["最高"].max()) if "最高" in tail.columns else None
+            lowest = safe_float(tail["最低"].min()) if "最低" in tail.columns else None
+            amplitude = None
+            if lowest not in (None, 0) and highest is not None:
+                amplitude = (highest / lowest - 1) * 100
+
+            label = f"近{len(tail)}日"
+            summary.update(
+                {
+                    "历史来源": resolved_source,
+                    "历史区间": f"{tail['日期'].iloc[0]} ~ {tail['日期'].iloc[-1]}"
+                    if "日期" in tail.columns
+                    else None,
+                    "历史天数": len(tail),
+                    f"{label}涨跌幅%": round_or_none(period_change),
+                    f"{label}振幅%": round_or_none(amplitude),
+                    f"{label}最高": round_or_none(highest),
+                    f"{label}最低": round_or_none(lowest),
+                }
+            )
+            if "成交额" in tail.columns:
+                summary[f"{label}日均成交额(亿)"] = round_or_none(
+                    tail["成交额"].mean() / 100_000_000
+                )
+            if "换手率" in tail.columns:
+                summary[f"{label}日均换手率%"] = round_or_none(tail["换手率"].mean())
+
+    if need_sr:
+        sr_payload = analyze_support_resistance(
+            hist_df=hist_df,
+            lookback_days=sr_days,
+            level_count=sr_levels,
+            pivot_window=sr_pivot_window,
+        )
+        if sr_payload:
+            if "历史来源" not in summary:
+                summary["历史来源"] = resolved_source
+            summary.update(sr_payload)
+    return summary
+
+
+def analyze_support_resistance(
+    hist_df: Any,
+    lookback_days: int,
+    level_count: int,
+    pivot_window: int,
+) -> dict[str, Any]:
+    if lookback_days <= 0 or level_count <= 0:
+        return {}
+    if pivot_window < 1:
+        pivot_window = 1
+
+    tail = hist_df.tail(lookback_days).copy()
+    required = {"收盘", "最高", "最低"}
+    if tail.empty or not required.issubset(set(tail.columns)):
         return {}
 
-    first_close = safe_float(tail["收盘"].iloc[0])
-    last_close = safe_float(tail["收盘"].iloc[-1])
-    period_change = None
-    if first_close not in (None, 0) and last_close is not None:
-        period_change = (last_close / first_close - 1) * 100
+    tail = tail.dropna(subset=["收盘", "最高", "最低"])
+    if len(tail) < pivot_window * 2 + 1:
+        return {}
 
-    highest = safe_float(tail["最高"].max()) if "最高" in tail.columns else None
-    lowest = safe_float(tail["最低"].min()) if "最低" in tail.columns else None
-    amplitude = None
-    if lowest not in (None, 0) and highest is not None:
-        amplitude = (highest / lowest - 1) * 100
+    current_price = safe_float(tail["收盘"].iloc[-1])
+    if current_price in (None, 0):
+        return {}
 
-    label = f"近{len(tail)}日"
-    summary = {
-        "历史来源": resolved_source,
-        "历史区间": f"{tail['日期'].iloc[0]} ~ {tail['日期'].iloc[-1]}"
-        if "日期" in tail.columns
-        else None,
-        "历史天数": len(tail),
-        f"{label}涨跌幅%": round_or_none(period_change),
-        f"{label}振幅%": round_or_none(amplitude),
-        f"{label}最高": round_or_none(highest),
-        f"{label}最低": round_or_none(lowest),
+    lows = [safe_float(v) for v in tail["最低"].tolist()]
+    highs = [safe_float(v) for v in tail["最高"].tolist()]
+    support_candidates: list[float] = []
+    resistance_candidates: list[float] = []
+
+    for idx in range(pivot_window, len(tail) - pivot_window):
+        center_low = lows[idx]
+        center_high = highs[idx]
+        low_window = lows[idx - pivot_window : idx + pivot_window + 1]
+        high_window = highs[idx - pivot_window : idx + pivot_window + 1]
+        if (
+            center_low is None
+            or center_high is None
+            or any(value is None for value in low_window)
+            or any(value is None for value in high_window)
+        ):
+            continue
+
+        if center_low == min(low_window):
+            support_candidates.append(center_low)
+        if center_high == max(high_window):
+            resistance_candidates.append(center_high)
+
+    range_low = safe_float(tail["最低"].min())
+    range_high = safe_float(tail["最高"].max())
+    if range_low is not None:
+        support_candidates.append(range_low)
+    if range_high is not None:
+        resistance_candidates.append(range_high)
+
+    supports = pick_price_levels(
+        candidates=support_candidates,
+        current_price=current_price,
+        level_count=level_count,
+        level_type="support",
+    )
+    resistances = pick_price_levels(
+        candidates=resistance_candidates,
+        current_price=current_price,
+        level_count=level_count,
+        level_type="resistance",
+    )
+
+    payload: dict[str, Any] = {
+        "支撑压力基准价": round_or_none(current_price),
+        "支撑压力回看天数": len(tail),
     }
-    if "成交额" in tail.columns:
-        summary[f"{label}日均成交额(亿)"] = round_or_none(
-            tail["成交额"].mean() / 100_000_000
-        )
-    if "换手率" in tail.columns:
-        summary[f"{label}日均换手率%"] = round_or_none(tail["换手率"].mean())
-    return summary
+    for index, value in enumerate(supports, start=1):
+        payload[f"支撑位{index}"] = round_or_none(value)
+    for index, value in enumerate(resistances, start=1):
+        payload[f"压力位{index}"] = round_or_none(value)
+    return payload
+
+
+def pick_price_levels(
+    candidates: list[float],
+    current_price: float,
+    level_count: int,
+    level_type: str,
+) -> list[float]:
+    clean_values = sorted(
+        {
+            round(value, 2)
+            for value in candidates
+            if value is not None and value > 0
+        }
+    )
+    if not clean_values:
+        return []
+
+    if level_type == "support":
+        preferred = [value for value in clean_values if value <= current_price]
+        fallback = [value for value in clean_values if value > current_price]
+        ordered = sorted(preferred, reverse=True) + sorted(fallback)
+    else:
+        preferred = [value for value in clean_values if value >= current_price]
+        fallback = [value for value in clean_values if value < current_price]
+        ordered = sorted(preferred) + sorted(fallback, reverse=True)
+
+    min_gap = max(current_price * 0.003, 0.02)
+    selected: list[float] = []
+    for value in ordered:
+        if all(abs(value - existing) >= min_gap for existing in selected):
+            selected.append(value)
+        if len(selected) >= level_count:
+            break
+    return selected
 
 
 def fetch_sina_history(
@@ -958,15 +1135,19 @@ def fetch_fund_flow(
         attempts = ["realtime"]
 
     for attempt in attempts:
-        try:
-            if attempt == "realtime":
-                result = fetch_fund_flow_realtime(code)
-            else:
-                result = fetch_fund_flow_daily(ak, code)
-            if result:
-                return result
-        except Exception:  # noqa: BLE001
-            continue
+        for retry in range(FUND_FLOW_RETRY_TIMES + 1):
+            try:
+                if attempt == "realtime":
+                    result = fetch_fund_flow_realtime(code)
+                else:
+                    result = fetch_fund_flow_daily(ak, code)
+                if result:
+                    return result
+            except Exception:  # noqa: BLE001
+                pass
+
+            if retry < FUND_FLOW_RETRY_TIMES:
+                time.sleep(0.3 * (retry + 1))
 
     # 静默失败，不影响其他数据获取。
     return {}
@@ -1156,6 +1337,10 @@ def build_record(ak: Any, row: Any, args: argparse.Namespace) -> dict[str, Any]:
         args.history_days,
         args.adjust,
         args.history_source,
+        include_sr=args.support_resistance,
+        sr_days=args.sr_days,
+        sr_levels=args.sr_levels,
+        sr_pivot_window=args.sr_pivot_window,
     )
     financial = fetch_financial_indicator(ak, code) if args.financial else {}
     fund_flow = (
@@ -1206,6 +1391,8 @@ def emit_result(df: Any, args: argparse.Namespace) -> None:
     else:
         columns = [col for col in DEFAULT_TABLE_COLUMNS if col in df.columns]
         columns.extend(col for col in df.columns if col.startswith("近") and col not in columns)
+        columns.extend(col for col in df.columns if col.startswith("支撑位") and col not in columns)
+        columns.extend(col for col in df.columns if col.startswith("压力位") and col not in columns)
         visible_df = df[columns] if columns else df
         payload = visible_df.to_string(index=False)
 
@@ -1220,6 +1407,13 @@ def emit_result(df: Any, args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.sr_days <= 0:
+        raise SystemExit("--sr-days 必须大于 0")
+    if args.sr_levels <= 0:
+        raise SystemExit("--sr-levels 必须大于 0")
+    if args.sr_pivot_window <= 0:
+        raise SystemExit("--sr-pivot-window 必须大于 0")
+
     ak = require_dependencies()
 
     try:
