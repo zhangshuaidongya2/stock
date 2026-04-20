@@ -67,6 +67,10 @@ DEFAULT_RUN_CONFIG = {
     "sr_levels": 3,
     # 局部高低点识别窗口（交易日）。
     "sr_pivot_window": 3,
+    # 是否计算扩展技术因子。
+    "advanced_factors": True,
+    # 扩展技术因子分析回看天数。
+    "factor_days": 120,
 }
 
 
@@ -117,6 +121,11 @@ DEFAULT_TABLE_COLUMNS = [
     "历史来源",
     "历史区间",
     "历史天数",
+    "均线趋势",
+    "20日突破信号",
+    "RSI14",
+    "ATR14%",
+    "成交量分位%",
     "支撑位1",
     "压力位1",
     "总市值(亿)",
@@ -258,6 +267,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_RUN_CONFIG["sr_pivot_window"],
         help="局部高低点识别窗口（交易日），默认 3。",
+    )
+    parser.add_argument(
+        "--advanced-factors",
+        action="store_true",
+        default=DEFAULT_RUN_CONFIG["advanced_factors"],
+        help="计算扩展技术因子（均线、RSI、ATR、量能分位等），默认开启。",
+    )
+    parser.add_argument(
+        "--no-advanced-factors",
+        action="store_false",
+        dest="advanced_factors",
+        help="不计算扩展技术因子。",
+    )
+    parser.add_argument(
+        "--factor-days",
+        type=int,
+        default=DEFAULT_RUN_CONFIG["factor_days"],
+        help="扩展技术因子分析回看天数，默认 120。",
     )
     parser.add_argument(
         "--delay",
@@ -807,13 +834,20 @@ def fetch_history_summary(
     sr_days: int = 120,
     sr_levels: int = 3,
     sr_pivot_window: int = 3,
+    include_factors: bool = False,
+    factor_days: int = 120,
 ) -> dict[str, Any]:
     need_summary = days > 0
     need_sr = include_sr and sr_days > 0 and sr_levels > 0
-    if not need_summary and not need_sr:
+    need_factors = include_factors and factor_days > 0
+    if not need_summary and not need_sr and not need_factors:
         return {}
 
-    lookback_days = max(days if days > 0 else 0, sr_days if need_sr else 0)
+    lookback_days = max(
+        days if days > 0 else 0,
+        sr_days if need_sr else 0,
+        factor_days if need_factors else 0,
+    )
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=max(40, lookback_days * 3))).strftime(
         "%Y%m%d"
@@ -905,6 +939,16 @@ def fetch_history_summary(
             if "历史来源" not in summary:
                 summary["历史来源"] = resolved_source
             summary.update(sr_payload)
+
+    if need_factors:
+        factor_payload = analyze_advanced_factors(
+            hist_df=hist_df,
+            lookback_days=factor_days,
+        )
+        if factor_payload:
+            if "历史来源" not in summary:
+                summary["历史来源"] = resolved_source
+            summary.update(factor_payload)
     return summary
 
 
@@ -1019,6 +1063,124 @@ def pick_price_levels(
         if len(selected) >= level_count:
             break
     return selected
+
+
+def analyze_advanced_factors(
+    hist_df: Any,
+    lookback_days: int,
+) -> dict[str, Any]:
+    tail = hist_df.tail(lookback_days).copy()
+    required = {"收盘", "最高", "最低"}
+    if tail.empty or not required.issubset(set(tail.columns)):
+        return {}
+
+    tail = tail.dropna(subset=["收盘", "最高", "最低"])
+    if tail.empty:
+        return {}
+
+    close = tail["收盘"].astype(float)
+    high = tail["最高"].astype(float)
+    low = tail["最低"].astype(float)
+
+    current_price = safe_float(close.iloc[-1])
+    if current_price in (None, 0):
+        return {}
+
+    ma20 = close.rolling(20).mean().iloc[-1] if len(close) >= 20 else None
+    ma60 = close.rolling(60).mean().iloc[-1] if len(close) >= 60 else None
+
+    dist_ma20 = None
+    ma20_value = safe_float(ma20)
+    if ma20_value not in (None, 0):
+        dist_ma20 = (current_price / ma20_value - 1) * 100
+
+    dist_ma60 = None
+    ma60_value = safe_float(ma60)
+    if ma60_value not in (None, 0):
+        dist_ma60 = (current_price / ma60_value - 1) * 100
+
+    trend_label = None
+    if ma20_value is not None and ma60_value is not None:
+        if current_price > ma20_value > ma60_value:
+            trend_label = "多头"
+        elif current_price < ma20_value < ma60_value:
+            trend_label = "空头"
+        else:
+            trend_label = "震荡"
+
+    breakout_signal = None
+    if len(tail) >= 21:
+        prev_high_20 = safe_float(high.rolling(20).max().shift(1).iloc[-1])
+        prev_low_20 = safe_float(low.rolling(20).min().shift(1).iloc[-1])
+        if prev_high_20 is not None and current_price > prev_high_20:
+            breakout_signal = "上破20日高点"
+        elif prev_low_20 is not None and current_price < prev_low_20:
+            breakout_signal = "下破20日低点"
+        else:
+            breakout_signal = "区间内"
+
+    previous_close = close.shift(1)
+    tr_df = pd.concat(
+        [
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
+        ],
+        axis=1,
+    )
+    tr = tr_df.max(axis=1)
+    atr14 = tr.rolling(14).mean().iloc[-1] if len(tr) >= 14 else None
+    atr14_value = safe_float(atr14)
+    atr14_pct = None
+    if atr14_value is not None and current_price:
+        atr14_pct = atr14_value / current_price * 100
+
+    rsi14 = None
+    if len(close) >= 15:
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, pd.NA)
+        rsi_series = 100 - 100 / (1 + rs)
+        rsi14 = safe_float(rsi_series.iloc[-1])
+        if rsi14 is None and safe_float(loss.iloc[-1]) == 0 and safe_float(gain.iloc[-1]) is not None:
+            rsi14 = 100.0
+
+    volume_pct = None
+    volume_ratio_20 = None
+    if "成交量" in tail.columns:
+        volume = pd.to_numeric(tail["成交量"], errors="coerce")
+        current_volume = safe_float(volume.iloc[-1])
+        valid_volume = volume.dropna()
+        if current_volume is not None and not valid_volume.empty:
+            volume_pct = float((valid_volume <= current_volume).mean() * 100)
+        if len(volume) >= 21:
+            vol_ma20 = safe_float(volume.rolling(20).mean().shift(1).iloc[-1])
+            if vol_ma20 not in (None, 0) and current_volume is not None:
+                volume_ratio_20 = current_volume / vol_ma20
+
+    turnover_pct = None
+    if "换手率" in tail.columns:
+        turnover = pd.to_numeric(tail["换手率"], errors="coerce").dropna()
+        if not turnover.empty:
+            current_turnover = safe_float(turnover.iloc[-1])
+            if current_turnover is not None:
+                turnover_pct = float((turnover <= current_turnover).mean() * 100)
+
+    return {
+        "均线20": round_or_none(ma20),
+        "均线60": round_or_none(ma60),
+        "距20日均线%": round_or_none(dist_ma20),
+        "距60日均线%": round_or_none(dist_ma60),
+        "均线趋势": trend_label,
+        "20日突破信号": breakout_signal,
+        "ATR14": round_or_none(atr14),
+        "ATR14%": round_or_none(atr14_pct),
+        "RSI14": round_or_none(rsi14),
+        "成交量分位%": round_or_none(volume_pct),
+        "量比20日均量": round_or_none(volume_ratio_20),
+        "换手率分位%": round_or_none(turnover_pct),
+    }
 
 
 def fetch_sina_history(
@@ -1341,6 +1503,8 @@ def build_record(ak: Any, row: Any, args: argparse.Namespace) -> dict[str, Any]:
         sr_days=args.sr_days,
         sr_levels=args.sr_levels,
         sr_pivot_window=args.sr_pivot_window,
+        include_factors=args.advanced_factors,
+        factor_days=args.factor_days,
     )
     financial = fetch_financial_indicator(ak, code) if args.financial else {}
     fund_flow = (
@@ -1413,6 +1577,8 @@ def main() -> None:
         raise SystemExit("--sr-levels 必须大于 0")
     if args.sr_pivot_window <= 0:
         raise SystemExit("--sr-pivot-window 必须大于 0")
+    if args.factor_days <= 0:
+        raise SystemExit("--factor-days 必须大于 0")
 
     ak = require_dependencies()
 
