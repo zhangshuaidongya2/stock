@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -42,7 +43,7 @@ SYMBOL_CACHE_PATH = Path(__file__).with_name("stock_symbols_cache.json")
 # 命令行未传参时使用的默认配置。
 DEFAULT_RUN_CONFIG = {
     # 要查询的股票（代码或名称，多个用逗号分隔）。
-    "symbols": "002342",
+    "symbols": "002342,000889",
     # 实时行情数据源：auto / eastmoney / tencent / sina。
     "quote_source": "tencent",
     # 历史行情数据源：auto / eastmoney / sina。
@@ -71,6 +72,8 @@ DEFAULT_RUN_CONFIG = {
     "advanced_factors": True,
     # 扩展技术因子分析回看天数。
     "factor_days": 120,
+    # 是否计算方向概率判断。
+    "predict_direction": True,
 }
 
 
@@ -126,6 +129,10 @@ DEFAULT_TABLE_COLUMNS = [
     "RSI14",
     "ATR14%",
     "成交量分位%",
+    "上涨概率%",
+    "下跌概率%",
+    "方向信号",
+    "置信度",
     "支撑位1",
     "压力位1",
     "总市值(亿)",
@@ -285,6 +292,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_RUN_CONFIG["factor_days"],
         help="扩展技术因子分析回看天数，默认 120。",
+    )
+    parser.add_argument(
+        "--predict-direction",
+        action="store_true",
+        default=DEFAULT_RUN_CONFIG["predict_direction"],
+        help="输出上涨/下跌概率和方向信号，默认开启。",
+    )
+    parser.add_argument(
+        "--no-predict-direction",
+        action="store_false",
+        dest="predict_direction",
+        help="不输出方向概率判断。",
     )
     parser.add_argument(
         "--delay",
@@ -1183,6 +1202,137 @@ def analyze_advanced_factors(
     }
 
 
+def predict_direction_signal(record: dict[str, Any]) -> dict[str, Any]:
+    score = 0.0
+    used_factors = 0
+    reasons: list[str] = []
+
+    trend = str(record.get("均线趋势") or "")
+    if trend == "多头":
+        score += 14
+        used_factors += 1
+        reasons.append("均线多头")
+    elif trend == "空头":
+        score -= 14
+        used_factors += 1
+        reasons.append("均线空头")
+    elif trend:
+        used_factors += 1
+
+    breakout = str(record.get("20日突破信号") or "")
+    if breakout == "上破20日高点":
+        score += 10
+        used_factors += 1
+        reasons.append("上破20日高点")
+    elif breakout == "下破20日低点":
+        score -= 10
+        used_factors += 1
+        reasons.append("下破20日低点")
+    elif breakout:
+        used_factors += 1
+
+    dist_ma20 = safe_float(record.get("距20日均线%"))
+    if dist_ma20 is not None:
+        used_factors += 1
+        momentum_score = max(min(dist_ma20 / 2.5, 8), -8)
+        if dist_ma20 > 18:
+            momentum_score -= min((dist_ma20 - 18) * 0.6, 6)
+        elif dist_ma20 < -18:
+            momentum_score += min((-dist_ma20 - 18) * 0.6, 6)
+        score += momentum_score
+
+    rsi14 = safe_float(record.get("RSI14"))
+    if rsi14 is not None:
+        used_factors += 1
+        if rsi14 < 30:
+            score += 8
+            reasons.append("RSI超卖")
+        elif rsi14 < 45:
+            score += 3
+        elif rsi14 > 70:
+            score -= 8
+            reasons.append("RSI超买")
+        elif rsi14 > 55:
+            score -= 3
+
+    main_ratio = safe_float(record.get("主力净占比%"))
+    if main_ratio is not None:
+        used_factors += 1
+        score += max(min(main_ratio * 1.2, 10), -10)
+    else:
+        main_inflow = safe_float(record.get("主力净流入(万)"))
+        if main_inflow is not None:
+            used_factors += 1
+            score += max(min(main_inflow / 8000, 6), -6)
+
+    current_price = safe_float(record.get("最新价"))
+    support_1 = safe_float(record.get("支撑位1"))
+    resistance_1 = safe_float(record.get("压力位1"))
+    if (
+        current_price is not None
+        and support_1 is not None
+        and resistance_1 is not None
+        and resistance_1 > support_1
+    ):
+        used_factors += 1
+        pos = (current_price - support_1) / (resistance_1 - support_1)
+        score += max(min((0.5 - pos) * 12, 6), -6)
+        if pos < 0.2:
+            reasons.append("靠近支撑")
+        elif pos > 0.8:
+            reasons.append("靠近压力")
+
+    recent_change = safe_float(record.get("近5日涨跌幅%"))
+    if recent_change is not None:
+        used_factors += 1
+        score += max(min(recent_change / 3, 6), -6)
+
+    intraday_speed = safe_float(record.get("涨速%"))
+    if intraday_speed is not None:
+        used_factors += 1
+        score += max(min(intraday_speed * 1.5, 3), -3)
+
+    if used_factors == 0:
+        return {}
+
+    up_probability = 1 / (1 + math.exp(-score / 9)) * 100
+    up_probability = round(max(min(up_probability, 95), 5), 2)
+    down_probability = round(100 - up_probability, 2)
+
+    if up_probability >= 57:
+        signal = "看涨"
+    elif up_probability <= 43:
+        signal = "看跌"
+    else:
+        signal = "中性"
+
+    confidence_score = abs(score) * 1.2 + used_factors * 2.5
+    atr_pct = safe_float(record.get("ATR14%"))
+    if atr_pct is not None:
+        if atr_pct >= 8:
+            confidence_score -= 6
+        elif atr_pct >= 5:
+            confidence_score -= 3
+
+    if confidence_score >= 30:
+        confidence = "高"
+    elif confidence_score >= 18:
+        confidence = "中"
+    else:
+        confidence = "低"
+
+    payload = {
+        "上涨概率%": up_probability,
+        "下跌概率%": down_probability,
+        "方向信号": signal,
+        "置信度": confidence,
+        "预测评分": round(score, 2),
+    }
+    if reasons:
+        payload["预测依据"] = "；".join(reasons[:3])
+    return payload
+
+
 def fetch_sina_history(
     ak: Any,
     code: str,
@@ -1539,6 +1689,8 @@ def build_record(ak: Any, row: Any, args: argparse.Namespace) -> dict[str, Any]:
         "流通市值(亿)": scale_or_none(row.get("流通市值"), 100_000_000),
     })
     record.update(history)
+    if args.predict_direction:
+        record.update(predict_direction_signal(record))
     record.update(financial)
     return sanitize(record)
 
