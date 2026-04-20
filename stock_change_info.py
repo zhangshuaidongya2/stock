@@ -56,6 +56,8 @@ DEFAULT_RUN_CONFIG = {
     "delay": 0.0,
     # 是否补充主力资金流数据。
     "fund_flow": True,
+    # 主力资金流模式：realtime / daily / auto。
+    "fund_flow_mode": "realtime",
 }
 
 
@@ -206,6 +208,15 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         dest="fund_flow",
         help="不获取主力资金流数据。",
+    )
+    parser.add_argument(
+        "--fund-flow-mode",
+        choices=["realtime", "daily", "auto"],
+        default=DEFAULT_RUN_CONFIG["fund_flow_mode"],
+        help=(
+            "资金流模式：realtime=仅实时(默认)；"
+            "daily=仅最近交易日日线；auto=实时失败时回退日线。"
+        ),
     )
     parser.add_argument(
         "--delay",
@@ -933,21 +944,29 @@ def fetch_financial_indicator(ak: Any, code: str) -> dict[str, Any]:
     return {"最近财务指标": sanitize(selected or latest)}
 
 
-def fetch_fund_flow(ak: Any, code: str) -> dict[str, Any]:
-    """获取个股主力资金流数据，优先实时，失败回退到最近日线。"""
-    try:
-        realtime = fetch_fund_flow_realtime(code)
-        if realtime:
-            return realtime
-    except Exception:  # noqa: BLE001
-        pass
+def fetch_fund_flow(
+    ak: Any,
+    code: str,
+    mode: str = "realtime",
+) -> dict[str, Any]:
+    """获取个股主力资金流数据。"""
+    if mode == "daily":
+        attempts = ["daily"]
+    elif mode == "auto":
+        attempts = ["realtime", "daily"]
+    else:
+        attempts = ["realtime"]
 
-    try:
-        daily_fallback = fetch_fund_flow_daily(ak, code)
-        if daily_fallback:
-            return daily_fallback
-    except Exception:  # noqa: BLE001
-        pass
+    for attempt in attempts:
+        try:
+            if attempt == "realtime":
+                result = fetch_fund_flow_realtime(code)
+            else:
+                result = fetch_fund_flow_daily(ak, code)
+            if result:
+                return result
+        except Exception:  # noqa: BLE001
+            continue
 
     # 静默失败，不影响其他数据获取。
     return {}
@@ -1139,7 +1158,11 @@ def build_record(ak: Any, row: Any, args: argparse.Namespace) -> dict[str, Any]:
         args.history_source,
     )
     financial = fetch_financial_indicator(ak, code) if args.financial else {}
-    fund_flow = fetch_fund_flow(ak, code) if args.fund_flow else {}
+    fund_flow = (
+        fetch_fund_flow(ak, code, mode=args.fund_flow_mode)
+        if args.fund_flow
+        else {}
+    )
 
     record = {
         "代码": code,
