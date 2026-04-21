@@ -8,10 +8,11 @@ Examples:
   python stock_fund_flow.py --symbols 000001 --days 10 --no-details
   python stock_fund_flow.py --symbols 000001 --days 10 --details
   python stock_fund_flow.py --symbols 300750 --days 30 --output fund_flow.csv --format csv
-  python stock_fund_flow.py --export-all-summary --days 30
+  python stock_fund_flow.py --export-all-summary
 
 Default JSON output contains 结论 only. Set DEFAULT_SHOW_DETAILS=True or pass
 --details to include daily fund-flow records.
+Full-market export writes 30/15/8/3 day summary columns to fund.csv by default.
 """
 
 from __future__ import annotations
@@ -31,11 +32,10 @@ FETCH_RETRY_TIMES = 3
 FETCH_RETRY_BASE_SLEEP = 0.8
 EASTMONEY_FUND_FLOW_DAY_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
 SYMBOL_CACHE_PATH = Path(__file__).with_name("stock_symbols_cache.json")
-DEFAULT_EXPORT_ALL_SUMMARY_PATH = Path(__file__).with_name(
-    "stock_fund_flow_30d_summary.csv"
-)
+DEFAULT_EXPORT_ALL_SUMMARY_PATH = Path(__file__).with_name("fund.csv")
+EXPORT_WINDOWS = [30, 15, 8, 3]
 DEFAULT_SYMBOLS = "002342"
-DEFAULT_DAYS = 125
+DEFAULT_DAYS = 30
 DEFAULT_FORMAT = "json"
 DEFAULT_SHOW_DETAILS = False
 
@@ -79,6 +79,28 @@ SUMMARY_COLUMNS = [
 ]
 
 
+def build_multi_window_summary_columns(windows: list[int]) -> list[str]:
+    columns = ["代码", "名称", "最新股价"]
+    for days in windows:
+        prefix = f"{days}日"
+        columns.extend(
+            [
+                f"{prefix}统计交易日数",
+                f"{prefix}起始股价",
+                f"{prefix}股价涨跌幅%",
+                f"{prefix}主力流入总和(万)",
+                f"{prefix}主力流出总和(万)",
+                f"{prefix}主力净流入合计(万)",
+                f"{prefix}主力流入天数",
+                f"{prefix}主力流出天数",
+            ]
+        )
+    return columns
+
+
+MULTI_WINDOW_SUMMARY_COLUMNS = build_multi_window_summary_columns(EXPORT_WINDOWS)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="抓取 A 股个股最近 N 个交易日的主力资金流入流出情况。"
@@ -104,7 +126,7 @@ def parse_args() -> argparse.Namespace:
         "--export-all-summary",
         action="store_true",
         help=(
-            "读取 stock_symbols_cache.json 中的全部股票，流式导出结论 CSV。"
+            "读取 stock_symbols_cache.json 中的全部股票，流式导出 30/15/8/3 日资金流 CSV。"
             f"不传 --output 时写入 {DEFAULT_EXPORT_ALL_SUMMARY_PATH.name}，"
             "如果文件已存在会跳过已导出的股票并从尾部追加。"
         ),
@@ -426,6 +448,80 @@ def build_summary_df(detail_df: Any, requested_days: int) -> Any:
     return pd.DataFrame(summaries, columns=SUMMARY_COLUMNS)
 
 
+def build_multi_window_summary_df(
+    detail_df: Any,
+    windows: list[int] | None = None,
+) -> Any:
+    windows = windows or EXPORT_WINDOWS
+    summaries = []
+    grouped = detail_df.groupby(["代码", "名称"], dropna=False, sort=False)
+
+    for (code, name), group in grouped:
+        dated_group = group.copy()
+        dated_group["_日期排序"] = pd.to_datetime(dated_group["日期"], errors="coerce")
+        dated_group = dated_group.dropna(subset=["_日期排序"]).sort_values("_日期排序")
+
+        latest_price = None
+        if not dated_group.empty:
+            latest_row = dated_group.iloc[-1]
+            latest_price = round_or_none(latest_row.get("收盘价"))
+
+        row = {
+            "代码": code,
+            "名称": name,
+            "最新股价": latest_price,
+        }
+
+        for days in windows:
+            prefix = f"{days}日"
+            period = dated_group.tail(days).copy()
+            day_count = int(len(period))
+            start_price = None
+            price_change_pct = None
+            inflow_total = None
+            outflow_total = None
+            net_total = None
+            inflow_days = 0
+            outflow_days = 0
+
+            if not period.empty:
+                start_row = period.iloc[0]
+                start_price = round_or_none(start_row.get("收盘价"))
+                if start_price not in (None, 0) and latest_price is not None:
+                    price_change_pct = round_or_none(
+                        (latest_price - start_price) / start_price * 100
+                    )
+
+            if not period.empty:
+                main_net = pd.to_numeric(period["主力净流入(万)"], errors="coerce")
+                valid_net = main_net.dropna()
+                if not valid_net.empty:
+                    inflow_values = valid_net[valid_net > 0]
+                    outflow_values = valid_net[valid_net < 0]
+                    inflow_total = round_or_none(inflow_values.sum())
+                    outflow_total = round_or_none(abs(outflow_values.sum()))
+                    net_total = round_or_none(valid_net.sum())
+                    inflow_days = int((valid_net > 0).sum())
+                    outflow_days = int((valid_net < 0).sum())
+
+            row.update(
+                {
+                    f"{prefix}统计交易日数": day_count,
+                    f"{prefix}起始股价": start_price,
+                    f"{prefix}股价涨跌幅%": price_change_pct,
+                    f"{prefix}主力流入总和(万)": inflow_total,
+                    f"{prefix}主力流出总和(万)": outflow_total,
+                    f"{prefix}主力净流入合计(万)": net_total,
+                    f"{prefix}主力流入天数": inflow_days,
+                    f"{prefix}主力流出天数": outflow_days,
+                }
+            )
+
+        summaries.append(row)
+
+    return pd.DataFrame(summaries, columns=MULTI_WINDOW_SUMMARY_COLUMNS)
+
+
 def fetch_fund_flow_raw_direct(code: str, market: str) -> Any:
     import requests
 
@@ -560,11 +656,17 @@ def emit_result(
 
 def append_summary_csv(summary_df: Any, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not output_path.exists() or output_path.stat().st_size == 0
+    if output_path.exists() and output_path.stat().st_size > 0:
+        with output_path.open("rb+") as file_obj:
+            file_obj.seek(-1, 2)
+            if file_obj.read(1) not in {b"\n", b"\r"}:
+                file_obj.write(b"\n")
     summary_df.to_csv(
         output_path,
         mode="a",
         index=False,
-        header=not output_path.exists(),
+        header=write_header,
     )
 
 
@@ -584,18 +686,49 @@ def read_exported_codes(output_path: Path) -> set[str]:
     }
 
 
+def normalize_existing_multi_window_export(output_path: Path) -> None:
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        return
+    try:
+        exported_df = pd.read_csv(output_path, dtype={"代码": str})
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"无法读取已有导出文件 {output_path}：{exc}") from exc
+
+    current_columns = list(exported_df.columns)
+    expected_columns = MULTI_WINDOW_SUMMARY_COLUMNS
+    if current_columns == expected_columns:
+        return
+
+    extra_columns = [col for col in current_columns if col not in expected_columns]
+    missing_columns = [col for col in expected_columns if col not in current_columns]
+    if missing_columns or any("日期" not in col for col in extra_columns):
+        raise SystemExit(
+            f"已有导出文件 {output_path} 的表头不是当前 fund.csv 格式，"
+            "为避免追加错列，已停止。请先备份或处理旧文件。"
+        )
+
+    exported_df = exported_df[expected_columns]
+    exported_df.to_csv(output_path, index=False)
+    print(
+        f"已移除已有导出文件中的日期列，更新为当前 fund.csv 表头：{output_path}",
+        file=sys.stderr,
+    )
+
+
 def export_all_summary(ak: Any, args: argparse.Namespace) -> None:
     output_path = (
         Path(args.output)
         if args.output
         else DEFAULT_EXPORT_ALL_SUMMARY_PATH
     )
+    fetch_days = max(EXPORT_WINDOWS)
     print("导出前预检东方财富资金流接口...", file=sys.stderr)
-    preflight_export_source(ak, args.days)
+    preflight_export_source(ak, fetch_days)
     print("预检通过，开始断点续跑写入文件。", file=sys.stderr)
 
     symbols = resolve_all_symbols()
     total = len(symbols)
+    normalize_existing_multi_window_export(output_path)
     exported_codes = read_exported_codes(output_path)
     pending_symbols = [
         symbol for symbol in symbols
@@ -605,7 +738,8 @@ def export_all_summary(ak: Any, args: argparse.Namespace) -> None:
     success_count = 0
 
     print(
-        f"开始导出最近 {args.days} 个交易日资金流结论："
+        f"开始导出最近 {fetch_days} 个交易日资金流多周期汇总："
+        f"输出窗口 {','.join(str(day) for day in EXPORT_WINDOWS)} 日，"
         f"缓存股票 {total} 只，已存在 {skipped_count} 只，"
         f"待抓取 {len(pending_symbols)} 只，输出文件 {output_path}",
         file=sys.stderr,
@@ -616,9 +750,8 @@ def export_all_summary(ak: Any, args: argparse.Namespace) -> None:
         name = symbol.get("名称", "")
         print(f"[{index}/{len(pending_symbols)}] 抓取 {code} {name} ...", file=sys.stderr)
         try:
-            detail_df = fetch_fund_flow(ak, symbol, args.days, args.ascending)
-            summary_df = build_summary_df(detail_df, requested_days=args.days)
-            conclusion = summary_df.iloc[0].get("结论", "")
+            detail_df = fetch_fund_flow(ak, symbol, fetch_days, args.ascending)
+            summary_df = build_multi_window_summary_df(detail_df, EXPORT_WINDOWS)
         except Exception as exc:  # noqa: BLE001
             error = f"{type(exc).__name__}: {exc}"
             raise SystemExit(
@@ -629,8 +762,14 @@ def export_all_summary(ak: Any, args: argparse.Namespace) -> None:
 
         append_summary_csv(summary_df, output_path)
         success_count += 1
+        row = summary_df.iloc[0]
+        net_parts = [
+            f"{days}日净流入{row.get(f'{days}日主力净流入合计(万)', '')}万"
+            for days in EXPORT_WINDOWS
+        ]
         print(
-            f"[{index}/{len(pending_symbols)}] 已写入 {code} {name}：{conclusion}",
+            f"[{index}/{len(pending_symbols)}] 已写入 {code} {name}："
+            + "，".join(net_parts),
             file=sys.stderr,
         )
 
