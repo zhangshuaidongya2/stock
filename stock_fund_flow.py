@@ -8,6 +8,7 @@ Examples:
   python stock_fund_flow.py --symbols 000001 --days 10 --no-details
   python stock_fund_flow.py --symbols 000001 --days 10 --details
   python stock_fund_flow.py --symbols 300750 --days 30 --output fund_flow.csv --format csv
+  python stock_fund_flow.py --export-all-summary --days 30
 
 Default JSON output contains 结论 only. Set DEFAULT_SHOW_DETAILS=True or pass
 --details to include daily fund-flow records.
@@ -25,7 +26,14 @@ from typing import Any
 
 pd = None
 
+REQUEST_TIMEOUT = 10
+FETCH_RETRY_TIMES = 3
+FETCH_RETRY_BASE_SLEEP = 0.8
+EASTMONEY_FUND_FLOW_DAY_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
 SYMBOL_CACHE_PATH = Path(__file__).with_name("stock_symbols_cache.json")
+DEFAULT_EXPORT_ALL_SUMMARY_PATH = Path(__file__).with_name(
+    "stock_fund_flow_30d_summary.csv"
+)
 DEFAULT_SYMBOLS = "002342"
 DEFAULT_DAYS = 125
 DEFAULT_FORMAT = "json"
@@ -91,6 +99,15 @@ def parse_args() -> argparse.Namespace:
         choices=["table", "json", "csv"],
         default=DEFAULT_FORMAT,
         help="输出格式：table / json / csv；默认 json。",
+    )
+    parser.add_argument(
+        "--export-all-summary",
+        action="store_true",
+        help=(
+            "读取 stock_symbols_cache.json 中的全部股票，流式导出结论 CSV。"
+            f"不传 --output 时写入 {DEFAULT_EXPORT_ALL_SUMMARY_PATH.name}，"
+            "如果文件已存在会跳过已导出的股票并从尾部追加。"
+        ),
     )
     details_group = parser.add_mutually_exclusive_group()
     details_group.add_argument(
@@ -200,6 +217,17 @@ def resolve_symbols(symbols: str) -> list[dict[str, str]]:
             + "。请改用股票代码，或更新 stock_symbols_cache.json。"
         )
     return resolved
+
+
+def resolve_all_symbols() -> list[dict[str, str]]:
+    name_map = read_symbol_cache()
+    if not name_map:
+        raise SystemExit("stock_symbols_cache.json 为空或无法解析")
+    symbols = [
+        {"代码": code, "名称": name}
+        for name, code in name_map.items()
+    ]
+    return sorted(symbols, key=lambda item: (detect_market(item["代码"]) == "bj", item["代码"]))
 
 
 def safe_float(value: Any) -> float | None:
@@ -398,16 +426,94 @@ def build_summary_df(detail_df: Any, requested_days: int) -> Any:
     return pd.DataFrame(summaries, columns=SUMMARY_COLUMNS)
 
 
+def fetch_fund_flow_raw_direct(code: str, market: str) -> Any:
+    import requests
+
+    market_map = {"sh": 1, "sz": 0, "bj": 0}
+    response = requests.get(
+        EASTMONEY_FUND_FLOW_DAY_URL,
+        params={
+            "lmt": "0",
+            "klt": "101",
+            "secid": f"{market_map[market]}.{code}",
+            "fields1": "f1,f2,f3,f7",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+            "ut": "b2884a393a59ad64002292a3e90d46a5",
+            "_": int(time.time() * 1000),
+        },
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    klines = payload.get("data", {}).get("klines")
+    if not isinstance(klines, list) or not klines:
+        raise RuntimeError("东方财富资金流日线返回空数据")
+
+    df = pd.DataFrame([item.split(",") for item in klines])
+    df.columns = [
+        "日期",
+        "主力净流入-净额",
+        "小单净流入-净额",
+        "中单净流入-净额",
+        "大单净流入-净额",
+        "超大单净流入-净额",
+        "主力净流入-净占比",
+        "小单净流入-净占比",
+        "中单净流入-净占比",
+        "大单净流入-净占比",
+        "超大单净流入-净占比",
+        "收盘价",
+        "涨跌幅",
+        "-",
+        "-",
+    ]
+    return df[
+        [
+            "日期",
+            "收盘价",
+            "涨跌幅",
+            "主力净流入-净额",
+            "超大单净流入-净额",
+            "大单净流入-净额",
+            "中单净流入-净额",
+            "小单净流入-净额",
+        ]
+    ]
+
+
 def fetch_fund_flow(ak: Any, symbol: dict[str, str], days: int, ascending: bool) -> Any:
     code = symbol["代码"]
     market = detect_market(code)
-    df = ak.stock_individual_fund_flow(stock=code, market=market)
+    errors = []
+    for retry in range(FETCH_RETRY_TIMES + 1):
+        try:
+            df = fetch_fund_flow_raw_direct(code, market)
+            break
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{type(exc).__name__}: {exc}")
+            if retry < FETCH_RETRY_TIMES:
+                time.sleep(FETCH_RETRY_BASE_SLEEP * (retry + 1))
+    else:
+        raise RuntimeError("；".join(errors))
+
     return normalize_fund_flow_df(
         df=df,
         symbol=symbol,
         days=days,
         ascending=ascending,
     )
+
+
+def preflight_export_source(ak: Any, days: int) -> None:
+    test_symbol = {"代码": "000001", "名称": "平安银行"}
+    try:
+        fetch_fund_flow(ak, test_symbol, min(days, 2), ascending=False)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "东方财富资金流接口当前不可用，已停止导出，避免生成大量失败行。"
+            f"预检股票 000001 失败：{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def emit_result(
@@ -452,6 +558,92 @@ def emit_result(
     print(payload)
 
 
+def append_summary_csv(summary_df: Any, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_df.to_csv(
+        output_path,
+        mode="a",
+        index=False,
+        header=not output_path.exists(),
+    )
+
+
+def read_exported_codes(output_path: Path) -> set[str]:
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        return set()
+    try:
+        exported_df = pd.read_csv(output_path, dtype={"代码": str})
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"无法读取已有导出文件 {output_path}：{exc}") from exc
+    if "代码" not in exported_df.columns:
+        raise SystemExit(f"已有导出文件 {output_path} 缺少“代码”列，无法断点续跑")
+    return {
+        normalize_code(code)
+        for code in exported_df["代码"].dropna()
+        if normalize_code(code)
+    }
+
+
+def export_all_summary(ak: Any, args: argparse.Namespace) -> None:
+    output_path = (
+        Path(args.output)
+        if args.output
+        else DEFAULT_EXPORT_ALL_SUMMARY_PATH
+    )
+    print("导出前预检东方财富资金流接口...", file=sys.stderr)
+    preflight_export_source(ak, args.days)
+    print("预检通过，开始断点续跑写入文件。", file=sys.stderr)
+
+    symbols = resolve_all_symbols()
+    total = len(symbols)
+    exported_codes = read_exported_codes(output_path)
+    pending_symbols = [
+        symbol for symbol in symbols
+        if normalize_code(symbol["代码"]) not in exported_codes
+    ]
+    skipped_count = total - len(pending_symbols)
+    success_count = 0
+
+    print(
+        f"开始导出最近 {args.days} 个交易日资金流结论："
+        f"缓存股票 {total} 只，已存在 {skipped_count} 只，"
+        f"待抓取 {len(pending_symbols)} 只，输出文件 {output_path}",
+        file=sys.stderr,
+    )
+
+    for index, symbol in enumerate(pending_symbols, start=1):
+        code = symbol["代码"]
+        name = symbol.get("名称", "")
+        print(f"[{index}/{len(pending_symbols)}] 抓取 {code} {name} ...", file=sys.stderr)
+        try:
+            detail_df = fetch_fund_flow(ak, symbol, args.days, args.ascending)
+            summary_df = build_summary_df(detail_df, requested_days=args.days)
+            conclusion = summary_df.iloc[0].get("结论", "")
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
+            raise SystemExit(
+                f"[{index}/{len(pending_symbols)}] 获取失败 {code} {name}：{error}\n"
+                "已停止导出；失败数据不会写入表格。修复或稍后重试后，"
+                "脚本会从已有 CSV 尾部继续追加未获取股票。"
+            ) from exc
+
+        append_summary_csv(summary_df, output_path)
+        success_count += 1
+        print(
+            f"[{index}/{len(pending_symbols)}] 已写入 {code} {name}：{conclusion}",
+            file=sys.stderr,
+        )
+
+        if args.delay > 0 and index < len(pending_symbols):
+            time.sleep(args.delay)
+
+    print(
+        f"导出完成：本次新增 {success_count} 只，累计跳过 {skipped_count} 只，"
+        f"文件 {output_path}",
+        file=sys.stderr,
+    )
+
+
 def main() -> None:
     args = parse_args()
     if args.days <= 0:
@@ -460,6 +652,11 @@ def main() -> None:
         raise SystemExit("--delay 不能小于 0")
 
     ak = require_dependencies()
+
+    if args.export_all_summary:
+        export_all_summary(ak, args)
+        return
+
     symbols = resolve_symbols(args.symbols)
 
     frames = []
