@@ -43,7 +43,7 @@ SYMBOL_CACHE_PATH = Path(__file__).with_name("stock_symbols_cache.json")
 # 命令行未传参时使用的默认配置。
 DEFAULT_RUN_CONFIG = {
     # 要查询的股票（代码或名称，多个用逗号分隔）。
-    "symbols": "002342,000889",
+    "symbols": "002342",
     # 实时行情数据源：auto / eastmoney / tencent / sina。
     "quote_source": "tencent",
     # 历史行情数据源：auto / eastmoney / sina。
@@ -61,7 +61,7 @@ DEFAULT_RUN_CONFIG = {
     # 主力资金流模式：realtime / daily / auto。
     "fund_flow_mode": "realtime",
     # 是否计算支撑位/压力位。
-    "support_resistance": True,
+    "support_resistance": False,
     # 支撑位/压力位分析回看天数。
     "sr_days": 120,
     # 支撑位/压力位返回层数。
@@ -69,11 +69,25 @@ DEFAULT_RUN_CONFIG = {
     # 局部高低点识别窗口（交易日）。
     "sr_pivot_window": 3,
     # 是否计算扩展技术因子。
-    "advanced_factors": True,
+    "advanced_factors": False,
     # 扩展技术因子分析回看天数。
     "factor_days": 120,
     # 是否计算方向概率判断。
-    "predict_direction": True,
+    "predict_direction": False,
+    # 方向判断的最小概率优势（超过 50% 的最小百分点）。
+    "predict_min_edge": 16.0,
+    # 是否输出买卖点建议。
+    "trade_decision": False,
+    # 买卖点判定最小得分阈值。
+    "trade_min_score": 4.0,
+    # 是否输出历史回测命中统计。
+    "backtest_hit_rate": False,
+    # 回测信号统计窗口（交易日）。
+    "backtest_days": 120,
+    # 回测信号持有周期（交易日）。
+    "backtest_horizon": 5,
+    # 回测最小信号样本数，低于该值标记为样本偏少。
+    "backtest_min_signals": 8,
 }
 
 
@@ -133,6 +147,20 @@ DEFAULT_TABLE_COLUMNS = [
     "下跌概率%",
     "方向信号",
     "置信度",
+    "买卖点",
+    "交易动作",
+    "买卖评分",
+    "买入评分",
+    "卖出评分",
+    "买卖依据",
+    "买点参考",
+    "卖点参考",
+    "止损位",
+    "回测信号样本",
+    "回测命中率%",
+    "回测买点命中率%",
+    "回测卖点命中率%",
+    "回测状态",
     "支撑位1",
     "压力位1",
     "总市值(亿)",
@@ -304,6 +332,60 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         dest="predict_direction",
         help="不输出方向概率判断。",
+    )
+    parser.add_argument(
+        "--predict-min-edge",
+        type=float,
+        default=DEFAULT_RUN_CONFIG["predict_min_edge"],
+        help="方向信号判定的最小概率优势百分点，默认 16。",
+    )
+    parser.add_argument(
+        "--trade-decision",
+        action="store_true",
+        default=DEFAULT_RUN_CONFIG["trade_decision"],
+        help="输出买点/卖点建议，默认开启。",
+    )
+    parser.add_argument(
+        "--no-trade-decision",
+        action="store_false",
+        dest="trade_decision",
+        help="不输出买点/卖点建议。",
+    )
+    parser.add_argument(
+        "--trade-min-score",
+        type=float,
+        default=DEFAULT_RUN_CONFIG["trade_min_score"],
+        help="买卖点判定最小得分阈值，默认 4。",
+    )
+    parser.add_argument(
+        "--backtest-hit-rate",
+        action="store_true",
+        default=DEFAULT_RUN_CONFIG["backtest_hit_rate"],
+        help="输出买卖点回测命中统计，默认开启。",
+    )
+    parser.add_argument(
+        "--no-backtest-hit-rate",
+        action="store_false",
+        dest="backtest_hit_rate",
+        help="不输出回测命中统计。",
+    )
+    parser.add_argument(
+        "--backtest-days",
+        type=int,
+        default=DEFAULT_RUN_CONFIG["backtest_days"],
+        help="回测信号统计窗口（交易日），默认 120。",
+    )
+    parser.add_argument(
+        "--backtest-horizon",
+        type=int,
+        default=DEFAULT_RUN_CONFIG["backtest_horizon"],
+        help="回测持有周期（交易日），默认 5。",
+    )
+    parser.add_argument(
+        "--backtest-min-signals",
+        type=int,
+        default=DEFAULT_RUN_CONFIG["backtest_min_signals"],
+        help="回测最小信号样本数，默认 8。",
     )
     parser.add_argument(
         "--delay",
@@ -855,11 +937,23 @@ def fetch_history_summary(
     sr_pivot_window: int = 3,
     include_factors: bool = False,
     factor_days: int = 120,
+    include_backtest: bool = False,
+    backtest_days: int = 120,
+    backtest_horizon: int = 5,
+    backtest_min_signals: int = 8,
+    predict_min_edge: float = 16.0,
+    trade_min_score: float = 4.0,
 ) -> dict[str, Any]:
     need_summary = days > 0
     need_sr = include_sr and sr_days > 0 and sr_levels > 0
     need_factors = include_factors and factor_days > 0
-    if not need_summary and not need_sr and not need_factors:
+    need_backtest = (
+        include_backtest
+        and backtest_days > 0
+        and backtest_horizon > 0
+        and backtest_min_signals > 0
+    )
+    if not need_summary and not need_sr and not need_factors and not need_backtest:
         return {}
 
     lookback_days = max(
@@ -867,6 +961,12 @@ def fetch_history_summary(
         sr_days if need_sr else 0,
         factor_days if need_factors else 0,
     )
+    if need_backtest:
+        backtest_warmup = max(60, sr_days, factor_days)
+        lookback_days = max(
+            lookback_days,
+            backtest_days + backtest_horizon + backtest_warmup,
+        )
     end_date = datetime.now().strftime("%Y%m%d")
     start_date = (datetime.now() - timedelta(days=max(40, lookback_days * 3))).strftime(
         "%Y%m%d"
@@ -968,6 +1068,24 @@ def fetch_history_summary(
             if "历史来源" not in summary:
                 summary["历史来源"] = resolved_source
             summary.update(factor_payload)
+
+    if need_backtest:
+        backtest_payload = analyze_trade_backtest_hit_rate(
+            hist_df=hist_df,
+            backtest_days=backtest_days,
+            horizon_days=backtest_horizon,
+            min_signals=backtest_min_signals,
+            factor_lookback=max(60, factor_days),
+            sr_lookback=max(60, sr_days),
+            sr_levels=max(1, sr_levels),
+            sr_pivot_window=max(1, sr_pivot_window),
+            predict_min_edge=predict_min_edge,
+            trade_min_score=trade_min_score,
+        )
+        if backtest_payload:
+            if "历史来源" not in summary:
+                summary["历史来源"] = resolved_source
+            summary.update(backtest_payload)
     return summary
 
 
@@ -1202,32 +1320,46 @@ def analyze_advanced_factors(
     }
 
 
-def predict_direction_signal(record: dict[str, Any]) -> dict[str, Any]:
+def predict_direction_signal(
+    record: dict[str, Any],
+    min_edge: float = 8.0,
+) -> dict[str, Any]:
     score = 0.0
     used_factors = 0
     reasons: list[str] = []
+    factor_signs: list[int] = []
+
+    def add_factor_score(value: float, *, mark_reason: str | None = None) -> None:
+        nonlocal score
+        score += value
+        if value > 0:
+            factor_signs.append(1)
+        elif value < 0:
+            factor_signs.append(-1)
+        if mark_reason:
+            reasons.append(mark_reason)
 
     trend = str(record.get("均线趋势") or "")
+    bull_regime = trend == "多头"
+    bear_regime = trend == "空头"
     if trend == "多头":
-        score += 14
+        add_factor_score(14, mark_reason="均线多头")
         used_factors += 1
-        reasons.append("均线多头")
     elif trend == "空头":
-        score -= 14
+        add_factor_score(-14, mark_reason="均线空头")
         used_factors += 1
-        reasons.append("均线空头")
     elif trend:
         used_factors += 1
 
     breakout = str(record.get("20日突破信号") or "")
     if breakout == "上破20日高点":
-        score += 10
+        add_factor_score(10, mark_reason="上破20日高点")
         used_factors += 1
-        reasons.append("上破20日高点")
+        bull_regime = True
     elif breakout == "下破20日低点":
-        score -= 10
+        add_factor_score(-10, mark_reason="下破20日低点")
         used_factors += 1
-        reasons.append("下破20日低点")
+        bear_regime = True
     elif breakout:
         used_factors += 1
 
@@ -1235,39 +1367,46 @@ def predict_direction_signal(record: dict[str, Any]) -> dict[str, Any]:
     if dist_ma20 is not None:
         used_factors += 1
         momentum_score = max(min(dist_ma20 / 2.5, 8), -8)
-        if dist_ma20 > 18:
+        if dist_ma20 > 18 and not bull_regime:
             momentum_score -= min((dist_ma20 - 18) * 0.6, 6)
-        elif dist_ma20 < -18:
+        elif dist_ma20 < -18 and not bear_regime:
             momentum_score += min((-dist_ma20 - 18) * 0.6, 6)
-        score += momentum_score
+        add_factor_score(momentum_score)
 
     rsi14 = safe_float(record.get("RSI14"))
     if rsi14 is not None:
         used_factors += 1
         if rsi14 < 30:
-            score += 8
-            reasons.append("RSI超卖")
+            if bear_regime:
+                add_factor_score(2, mark_reason="RSI超卖")
+            else:
+                add_factor_score(8, mark_reason="RSI超卖")
         elif rsi14 < 45:
-            score += 3
+            add_factor_score(3)
         elif rsi14 > 70:
-            score -= 8
-            reasons.append("RSI超买")
+            if bull_regime:
+                penalty = -2 if rsi14 <= 80 else -4
+                add_factor_score(penalty, mark_reason="RSI超买")
+            else:
+                add_factor_score(-8, mark_reason="RSI超买")
         elif rsi14 > 55:
-            score -= 3
+            add_factor_score(-3)
 
     main_ratio = safe_float(record.get("主力净占比%"))
     if main_ratio is not None:
         used_factors += 1
-        score += max(min(main_ratio * 1.2, 10), -10)
+        add_factor_score(max(min(main_ratio * 1.2, 10), -10))
     else:
         main_inflow = safe_float(record.get("主力净流入(万)"))
         if main_inflow is not None:
             used_factors += 1
-            score += max(min(main_inflow / 8000, 6), -6)
+            add_factor_score(max(min(main_inflow / 8000, 6), -6))
 
     current_price = safe_float(record.get("最新价"))
     support_1 = safe_float(record.get("支撑位1"))
     resistance_1 = safe_float(record.get("压力位1"))
+    near_resistance = False
+    near_support = False
     if (
         current_price is not None
         and support_1 is not None
@@ -1276,43 +1415,81 @@ def predict_direction_signal(record: dict[str, Any]) -> dict[str, Any]:
     ):
         used_factors += 1
         pos = (current_price - support_1) / (resistance_1 - support_1)
-        score += max(min((0.5 - pos) * 12, 6), -6)
+        add_factor_score(max(min((0.5 - pos) * 12, 6), -6))
         if pos < 0.2:
+            near_support = True
             reasons.append("靠近支撑")
         elif pos > 0.8:
+            near_resistance = True
             reasons.append("靠近压力")
 
     recent_change = safe_float(record.get("近5日涨跌幅%"))
     if recent_change is not None:
         used_factors += 1
-        score += max(min(recent_change / 3, 6), -6)
+        # 强趋势行情中，最近涨跌幅更偏向趋势延续，而非均值回归。
+        if bull_regime and recent_change > 0:
+            add_factor_score(max(min(recent_change / 4, 4), -4))
+        elif bear_regime and recent_change < 0:
+            add_factor_score(max(min(recent_change / 4, 4), -4))
+        else:
+            add_factor_score(max(min(recent_change / 3, 6), -6))
 
     intraday_speed = safe_float(record.get("涨速%"))
     if intraday_speed is not None:
         used_factors += 1
-        score += max(min(intraday_speed * 1.5, 3), -3)
+        add_factor_score(max(min(intraday_speed * 1.5, 3), -3))
+
+    daily_change = safe_float(record.get("涨跌幅%"))
+    if daily_change is not None:
+        used_factors += 1
+        add_factor_score(max(min(daily_change * 1.6, 8), -8))
+        if daily_change <= -2:
+            reasons.append("当日走弱")
+        elif daily_change >= 2:
+            reasons.append("当日走强")
+
+    # 高位+超买+当日转弱时，额外降低看涨分。
+    if near_resistance and rsi14 is not None and rsi14 >= 70 and daily_change is not None and daily_change < 0:
+        add_factor_score(-6, mark_reason="高位回落")
 
     if used_factors == 0:
         return {}
+
+    positive_count = sum(1 for sign in factor_signs if sign > 0)
+    negative_count = sum(1 for sign in factor_signs if sign < 0)
+    total_sign_count = positive_count + negative_count
+    if total_sign_count > 0:
+        dominant_ratio = max(positive_count, negative_count) / total_sign_count
+    else:
+        dominant_ratio = 0.5
+
+    # 因子一致性低时降权，避免“看起来很确定但方向反了”。
+    if dominant_ratio < 0.6:
+        score *= 0.75
+    elif dominant_ratio > 0.8:
+        score *= 1.08
 
     up_probability = 1 / (1 + math.exp(-score / 9)) * 100
     up_probability = round(max(min(up_probability, 95), 5), 2)
     down_probability = round(100 - up_probability, 2)
 
-    if up_probability >= 57:
-        signal = "看涨"
-    elif up_probability <= 43:
-        signal = "看跌"
-    else:
+    edge = abs(up_probability - 50)
+    if edge < min_edge:
         signal = "中性"
+    elif up_probability >= 50:
+        signal = "看涨"
+    else:
+        signal = "看跌"
 
-    confidence_score = abs(score) * 1.2 + used_factors * 2.5
+    confidence_score = abs(score) * 1.2 + used_factors * 2.5 + (dominant_ratio - 0.5) * 10
     atr_pct = safe_float(record.get("ATR14%"))
     if atr_pct is not None:
         if atr_pct >= 8:
             confidence_score -= 6
         elif atr_pct >= 5:
             confidence_score -= 3
+    if edge < min_edge:
+        confidence_score -= 5
 
     if confidence_score >= 30:
         confidence = "高"
@@ -1327,9 +1504,294 @@ def predict_direction_signal(record: dict[str, Any]) -> dict[str, Any]:
         "方向信号": signal,
         "置信度": confidence,
         "预测评分": round(score, 2),
+        "预测一致性%": round(dominant_ratio * 100, 2),
     }
     if reasons:
         payload["预测依据"] = "；".join(reasons[:3])
+    return payload
+
+
+def build_trade_decision(
+    record: dict[str, Any],
+    min_score: float = 4.0,
+) -> dict[str, Any]:
+    buy_score = 0.0
+    sell_score = 0.0
+    buy_reasons: list[str] = []
+    sell_reasons: list[str] = []
+
+    def add_buy(value: float, reason: str | None = None) -> None:
+        nonlocal buy_score
+        buy_score += value
+        if reason:
+            buy_reasons.append(reason)
+
+    def add_sell(value: float, reason: str | None = None) -> None:
+        nonlocal sell_score
+        sell_score += value
+        if reason:
+            sell_reasons.append(reason)
+
+    trend = str(record.get("均线趋势") or "")
+    if trend == "多头":
+        add_buy(2.0, "均线多头")
+    elif trend == "空头":
+        add_sell(2.0, "均线空头")
+
+    breakout = str(record.get("20日突破信号") or "")
+    if breakout == "上破20日高点":
+        add_buy(1.6, "上破20日高点")
+    elif breakout == "下破20日低点":
+        add_sell(1.6, "下破20日低点")
+
+    direction = str(record.get("方向信号") or "")
+    if direction == "看涨":
+        add_buy(2.0, "方向信号看涨")
+    elif direction == "看跌":
+        add_sell(2.0, "方向信号看跌")
+
+    up_prob = safe_float(record.get("上涨概率%"))
+    if up_prob is not None and up_prob >= 62:
+        add_buy(0.8)
+    down_prob = safe_float(record.get("下跌概率%"))
+    if down_prob is not None and down_prob >= 62:
+        add_sell(0.8)
+
+    rsi14 = safe_float(record.get("RSI14"))
+    if rsi14 is not None:
+        if 45 <= rsi14 <= 65:
+            add_buy(1.0, "RSI位于强势区间")
+        elif rsi14 < 30:
+            add_buy(0.8, "RSI超卖")
+        elif rsi14 > 70:
+            add_sell(1.2, "RSI超买")
+
+    main_ratio = safe_float(record.get("主力净占比%"))
+    if main_ratio is not None:
+        if main_ratio >= 3:
+            add_buy(1.0, "主力净流入占比高")
+        elif main_ratio <= -3:
+            add_sell(1.0, "主力净流出占比高")
+
+    volume_ratio = safe_float(record.get("量比20日均量"))
+    if volume_ratio is not None and volume_ratio >= 1.2:
+        if breakout == "上破20日高点":
+            add_buy(0.8, "放量突破")
+        elif breakout == "下破20日低点":
+            add_sell(0.8, "放量下破")
+
+    daily_change = safe_float(record.get("涨跌幅%"))
+    if daily_change is not None:
+        if daily_change >= 2:
+            add_buy(0.6)
+        elif daily_change <= -2:
+            add_sell(0.6)
+
+    current_price = safe_float(record.get("最新价"))
+    support_1 = safe_float(record.get("支撑位1"))
+    resistance_1 = safe_float(record.get("压力位1"))
+    if (
+        current_price is not None
+        and support_1 is not None
+        and resistance_1 is not None
+        and resistance_1 > support_1
+    ):
+        pos = (current_price - support_1) / (resistance_1 - support_1)
+        if pos <= 0.2:
+            add_buy(1.2, "接近支撑位")
+        elif pos >= 0.8:
+            add_sell(1.2, "接近压力位")
+
+    atr14_pct = safe_float(record.get("ATR14%"))
+    if atr14_pct is not None and atr14_pct >= 8:
+        # 高波动时降低动作激进度。
+        buy_score -= 0.8
+        sell_score -= 0.8
+
+    score_gap = buy_score - sell_score
+    reasons: list[str]
+    if buy_score >= min_score and score_gap >= 1:
+        decision = "买点"
+        action = "关注分批买入"
+        reasons = buy_reasons
+    elif sell_score >= min_score and score_gap <= -1:
+        decision = "卖点"
+        action = "考虑减仓/止盈"
+        reasons = sell_reasons
+    else:
+        decision = "观望"
+        action = "等待更清晰信号"
+        reasons = (buy_reasons[:2] + sell_reasons[:2])[:4]
+
+    payload: dict[str, Any] = {
+        "买卖点": decision,
+        "交易动作": action,
+        "买入评分": round(buy_score, 2),
+        "卖出评分": round(sell_score, 2),
+        "买卖评分": round(score_gap, 2),
+    }
+
+    if reasons:
+        payload["买卖依据"] = "；".join(reasons[:4])
+
+    if support_1 is not None:
+        payload["买点参考"] = round_or_none(support_1)
+    if resistance_1 is not None:
+        payload["卖点参考"] = round_or_none(resistance_1)
+
+    if decision == "买点":
+        stop_loss = None
+        if support_1 is not None:
+            stop_loss = support_1 * 0.98
+        else:
+            atr14 = safe_float(record.get("ATR14"))
+            if current_price is not None and atr14 is not None:
+                stop_loss = current_price - atr14 * 1.5
+        if stop_loss is not None and stop_loss > 0:
+            payload["止损位"] = round(stop_loss, 2)
+
+    return payload
+
+
+def analyze_trade_backtest_hit_rate(
+    hist_df: Any,
+    backtest_days: int,
+    horizon_days: int,
+    min_signals: int,
+    factor_lookback: int,
+    sr_lookback: int,
+    sr_levels: int,
+    sr_pivot_window: int,
+    predict_min_edge: float,
+    trade_min_score: float,
+) -> dict[str, Any]:
+    required = {"收盘", "最高", "最低"}
+    if hist_df is None or hist_df.empty or not required.issubset(set(hist_df.columns)):
+        return {}
+    if backtest_days <= 0 or horizon_days <= 0:
+        return {}
+
+    df = hist_df.copy()
+    for col in ["收盘", "最高", "最低", "涨跌幅"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["收盘", "最高", "最低"])
+    if len(df) <= horizon_days + 20:
+        return {}
+
+    close = df["收盘"].astype(float)
+    total_len = len(df)
+    start_idx = max(0, total_len - (backtest_days + horizon_days))
+    end_idx = total_len - horizon_days - 1
+    if end_idx < start_idx:
+        return {}
+
+    trades: list[dict[str, Any]] = []
+    for idx in range(start_idx, end_idx + 1):
+        current_price = safe_float(close.iloc[idx])
+        future_price = safe_float(close.iloc[idx + horizon_days])
+        if current_price in (None, 0) or future_price is None:
+            continue
+
+        window_df = df.iloc[: idx + 1]
+        record: dict[str, Any] = {
+            "最新价": current_price,
+        }
+
+        if "涨跌幅" in df.columns:
+            record["涨跌幅%"] = safe_float(df["涨跌幅"].iloc[idx])
+
+        if idx >= 4:
+            base_close = safe_float(close.iloc[idx - 4])
+            if base_close not in (None, 0):
+                record["近5日涨跌幅%"] = (current_price / base_close - 1) * 100
+
+        factor_payload = analyze_advanced_factors(
+            hist_df=window_df,
+            lookback_days=min(max(20, factor_lookback), len(window_df)),
+        )
+        if factor_payload:
+            record.update(factor_payload)
+
+        sr_payload = analyze_support_resistance(
+            hist_df=window_df,
+            lookback_days=min(max(20, sr_lookback), len(window_df)),
+            level_count=max(1, sr_levels),
+            pivot_window=max(1, sr_pivot_window),
+        )
+        if sr_payload:
+            record.update(sr_payload)
+
+        direction_payload = predict_direction_signal(
+            record=record,
+            min_edge=predict_min_edge,
+        )
+        if direction_payload:
+            record.update(direction_payload)
+
+        decision_payload = build_trade_decision(
+            record=record,
+            min_score=trade_min_score,
+        )
+        decision = str(decision_payload.get("买卖点") or "")
+        if decision not in ("买点", "卖点"):
+            continue
+
+        future_return = (future_price / current_price - 1) * 100
+        if decision == "买点":
+            is_hit = future_return > 0
+            signed_return = future_return
+        else:
+            is_hit = future_return < 0
+            signed_return = -future_return
+
+        trades.append(
+            {
+                "decision": decision,
+                "is_hit": is_hit,
+                "signed_return": signed_return,
+            }
+        )
+
+    sample_size = len(trades)
+    if sample_size == 0:
+        return {
+            "回测信号样本": 0,
+            "回测命中率%": None,
+            "回测买点命中率%": None,
+            "回测卖点命中率%": None,
+            "回测状态": "无交易信号",
+        }
+
+    buy_trades = [item for item in trades if item["decision"] == "买点"]
+    sell_trades = [item for item in trades if item["decision"] == "卖点"]
+    hit_count = sum(1 for item in trades if item["is_hit"])
+    buy_hit_count = sum(1 for item in buy_trades if item["is_hit"])
+    sell_hit_count = sum(1 for item in sell_trades if item["is_hit"])
+
+    payload: dict[str, Any] = {
+        "回测信号样本": sample_size,
+        "回测买点样本": len(buy_trades),
+        "回测卖点样本": len(sell_trades),
+        "回测命中率%": round(hit_count * 100 / sample_size, 2),
+        "回测买点命中率%": (
+            round(buy_hit_count * 100 / len(buy_trades), 2) if buy_trades else None
+        ),
+        "回测卖点命中率%": (
+            round(sell_hit_count * 100 / len(sell_trades), 2) if sell_trades else None
+        ),
+        "回测平均收益%": round(
+            sum(float(item["signed_return"]) for item in trades) / sample_size,
+            2,
+        ),
+        "回测状态": "有效" if sample_size >= min_signals else "样本偏少",
+    }
+
+    if "日期" in df.columns and len(df) > 0:
+        signal_start = df["日期"].iloc[start_idx]
+        signal_end = df["日期"].iloc[end_idx]
+        payload["回测区间"] = f"{signal_start} ~ {signal_end}"
+
     return payload
 
 
@@ -1655,6 +2117,12 @@ def build_record(ak: Any, row: Any, args: argparse.Namespace) -> dict[str, Any]:
         sr_pivot_window=args.sr_pivot_window,
         include_factors=args.advanced_factors,
         factor_days=args.factor_days,
+        include_backtest=args.backtest_hit_rate,
+        backtest_days=args.backtest_days,
+        backtest_horizon=args.backtest_horizon,
+        backtest_min_signals=args.backtest_min_signals,
+        predict_min_edge=args.predict_min_edge,
+        trade_min_score=args.trade_min_score,
     )
     financial = fetch_financial_indicator(ak, code) if args.financial else {}
     fund_flow = (
@@ -1690,7 +2158,19 @@ def build_record(ak: Any, row: Any, args: argparse.Namespace) -> dict[str, Any]:
     })
     record.update(history)
     if args.predict_direction:
-        record.update(predict_direction_signal(record))
+        record.update(
+            predict_direction_signal(
+                record,
+                min_edge=args.predict_min_edge,
+            )
+        )
+    if args.trade_decision:
+        record.update(
+            build_trade_decision(
+                record,
+                min_score=args.trade_min_score,
+            )
+        )
     record.update(financial)
     return sanitize(record)
 
@@ -1731,6 +2211,16 @@ def main() -> None:
         raise SystemExit("--sr-pivot-window 必须大于 0")
     if args.factor_days <= 0:
         raise SystemExit("--factor-days 必须大于 0")
+    if args.predict_min_edge < 0 or args.predict_min_edge > 49:
+        raise SystemExit("--predict-min-edge 必须在 0 到 49 之间")
+    if args.trade_min_score <= 0:
+        raise SystemExit("--trade-min-score 必须大于 0")
+    if args.backtest_days <= 0:
+        raise SystemExit("--backtest-days 必须大于 0")
+    if args.backtest_horizon <= 0:
+        raise SystemExit("--backtest-horizon 必须大于 0")
+    if args.backtest_min_signals <= 0:
+        raise SystemExit("--backtest-min-signals 必须大于 0")
 
     ak = require_dependencies()
 
