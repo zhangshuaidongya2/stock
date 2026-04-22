@@ -61,7 +61,7 @@ DEFAULT_RUN_CONFIG = {
     # 主力资金流模式：realtime / daily / auto。
     "fund_flow_mode": "realtime",
     # 是否计算支撑位/压力位。
-    "support_resistance": False,
+    "support_resistance": True,
     # 支撑位/压力位分析回看天数。
     "sr_days": 120,
     # 支撑位/压力位返回层数。
@@ -69,19 +69,19 @@ DEFAULT_RUN_CONFIG = {
     # 局部高低点识别窗口（交易日）。
     "sr_pivot_window": 3,
     # 是否计算扩展技术因子。
-    "advanced_factors": False,
+    "advanced_factors": True,
     # 扩展技术因子分析回看天数。
     "factor_days": 120,
     # 是否计算方向概率判断。
-    "predict_direction": False,
+    "predict_direction": True,
     # 方向判断的最小概率优势（超过 50% 的最小百分点）。
     "predict_min_edge": 16.0,
     # 是否输出买卖点建议。
-    "trade_decision": False,
+    "trade_decision": True,
     # 买卖点判定最小得分阈值。
     "trade_min_score": 4.0,
     # 是否输出历史回测命中统计。
-    "backtest_hit_rate": False,
+    "backtest_hit_rate": True,
     # 回测信号统计窗口（交易日）。
     "backtest_days": 120,
     # 回测信号持有周期（交易日）。
