@@ -5,7 +5,7 @@ Default run:
   python stock_change_info.py
 
 Override examples:
-  python stock_change_info.py --symbols 000001,002342,600519 --history-days 30
+  python stock_change_info.py --code 000001,002342,600519 --history-days 30
   python stock_change_info.py --quote-source auto --history-source auto
   python stock_change_info.py --min-change 5 --top 20 --format table
   python stock_change_info.py --min-change 4 --output result.csv --format csv
@@ -43,7 +43,7 @@ SYMBOL_CACHE_PATH = Path(__file__).with_name("stock_symbols_cache.json")
 # 命令行未传参时使用的默认配置。
 DEFAULT_RUN_CONFIG = {
     # 要查询的股票（代码或名称，多个用逗号分隔）。
-    "symbols": "002342,002149,002361",
+    "code": "002342",
     # 实时行情数据源：auto / eastmoney / tencent / sina。
     "quote_source": "tencent",
     # 历史行情数据源：auto / eastmoney / sina。
@@ -174,8 +174,8 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--symbols",
-        default=DEFAULT_RUN_CONFIG["symbols"],
+        "--code",
+        default=DEFAULT_RUN_CONFIG["code"],
         help="只查询指定股票，支持代码或名称，多个值用逗号分隔；不传则扫描全市场。",
     )
     parser.add_argument(
@@ -814,8 +814,8 @@ def filter_by_symbols(df: Any, symbols: str) -> Any:
 
 
 def filter_by_change(df: Any, args: argparse.Namespace) -> Any:
-    if args.symbols:
-        return filter_by_symbols(df, args.symbols)
+    if args.code:
+        return filter_by_symbols(df, args.code)
 
     masks = []
     if args.min_change is not None and "涨跌幅" in df.columns:
@@ -2225,7 +2225,7 @@ def main() -> None:
     ak = require_dependencies()
 
     try:
-        spot_df = fetch_spot_quotes(ak, args.symbols, args.quote_source)
+        spot_df = fetch_spot_quotes(ak, args.code, args.quote_source)
         selected_df = filter_by_change(spot_df, args)
         selected_df = sort_and_limit(selected_df, args)
     except RuntimeError as exc:

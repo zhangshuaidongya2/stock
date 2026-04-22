@@ -4,6 +4,7 @@
 Examples:
   python analyze_stock_fund_flow.py
   python analyze_stock_fund_flow.py --days 15 --money 10
+  python analyze_stock_fund_flow.py --days 15 --money 10 --max-change 5
   python analyze_stock_fund_flow.py --days 7 --money 5
   python analyze_stock_fund_flow.py --days 3 --format table
   python analyze_stock_fund_flow.py --days 30 --output strong_inflow.json
@@ -77,6 +78,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_MIN_NET_INFLOW_YI,
         help=f"最小主力净流入阈值，单位亿元，默认 {DEFAULT_MIN_NET_INFLOW_YI:g}。",
+    )
+    parser.add_argument(
+        "--max-change",
+        type=float,
+        help="股价涨跌幅上限，单位百分比；例如 5 表示只保留涨跌幅小于 5%% 的股票。",
     )
     parser.add_argument(
         "--code",
@@ -198,6 +204,7 @@ def filter_strong_inflow(
     df: pd.DataFrame,
     days: int,
     min_net_inflow_yi: float,
+    max_change_pct: float | None = None,
 ) -> pd.DataFrame:
     threshold_wan = min_net_inflow_yi * 10000
     result = select_window(df, days)
@@ -206,6 +213,14 @@ def filter_strong_inflow(
         errors="coerce",
     )
     result = result[result[NET_INFLOW_FIELD] > threshold_wan].copy()
+    if max_change_pct is not None:
+        if "股价涨跌幅%" not in result.columns:
+            raise SystemExit("CSV 缺少字段：股价涨跌幅%")
+        result["股价涨跌幅%"] = pd.to_numeric(
+            result["股价涨跌幅%"],
+            errors="coerce",
+        )
+        result = result[result["股价涨跌幅%"] < max_change_pct].copy()
     result["主力净流入合计(亿)"] = (result[NET_INFLOW_FIELD] / 10000).round(2)
     result = result.sort_values(NET_INFLOW_FIELD, ascending=False)
     columns = [column for column in OUTPUT_COLUMNS if column in result.columns]
@@ -424,11 +439,18 @@ def main() -> None:
         source_df,
         days=args.days,
         min_net_inflow_yi=args.money,
+        max_change_pct=args.max_change,
     )
     output_path = args.output or str(DEFAULT_OUTPUT_PATH)
     print(
         f"输入 {len(source_df)} 条，筛选 {args.days} 日主力净流入 > "
-        f"{args.money:g} 亿：{len(result_df)} 条",
+        f"{args.money:g} 亿"
+        + (
+            f"，股价涨跌幅 < {args.max_change:g}%"
+            if args.max_change is not None
+            else ""
+        )
+        + f"：{len(result_df)} 条",
         file=sys.stderr,
     )
     emit_result(result_df, args.format, output_path)
