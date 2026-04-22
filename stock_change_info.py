@@ -43,7 +43,7 @@ SYMBOL_CACHE_PATH = Path(__file__).with_name("stock_symbols_cache.json")
 # 命令行未传参时使用的默认配置。
 DEFAULT_RUN_CONFIG = {
     # 要查询的股票（代码或名称，多个用逗号分隔）。
-    "symbols": "002342",
+    "symbols": "002342,002149,002361",
     # 实时行情数据源：auto / eastmoney / tencent / sina。
     "quote_source": "tencent",
     # 历史行情数据源：auto / eastmoney / sina。
