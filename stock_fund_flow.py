@@ -12,7 +12,7 @@ Examples:
 
 Default JSON output contains 结论 only. Set DEFAULT_SHOW_DETAILS=True or pass
 --details to include daily fund-flow records.
-Full-market export writes 30/15/8/3 day summary columns to fund.csv by default.
+Full-market export writes 30/15/8/3 day summary columns to data/fund.csv by default.
 """
 
 from __future__ import annotations
@@ -31,8 +31,10 @@ REQUEST_TIMEOUT = 10
 FETCH_RETRY_TIMES = 3
 FETCH_RETRY_BASE_SLEEP = 0.8
 EASTMONEY_FUND_FLOW_DAY_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-SYMBOL_CACHE_PATH = Path(__file__).with_name("stock_symbols_cache.json")
-DEFAULT_EXPORT_ALL_SUMMARY_PATH = Path(__file__).with_name("fund.csv")
+PROJECT_DIR = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_DIR / "data"
+SYMBOL_CACHE_PATH = PROJECT_DIR / "stock_symbols_cache.json"
+DEFAULT_EXPORT_ALL_SUMMARY_PATH = DATA_DIR / "fund.csv"
 EXPORT_WINDOWS = [30, 15, 8, 3]
 DEFAULT_SYMBOLS = "002342"
 DEFAULT_DAYS = 30
@@ -101,6 +103,13 @@ def build_multi_window_summary_columns(windows: list[int]) -> list[str]:
 MULTI_WINDOW_SUMMARY_COLUMNS = build_multi_window_summary_columns(EXPORT_WINDOWS)
 
 
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(PROJECT_DIR))
+    except ValueError:
+        return str(path)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="抓取 A 股个股最近 N 个交易日的主力资金流入流出情况。"
@@ -127,7 +136,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "读取 stock_symbols_cache.json 中的全部股票，流式导出 30/15/8/3 日资金流 CSV。"
-            f"不传 --output 时写入 {DEFAULT_EXPORT_ALL_SUMMARY_PATH.name}，"
+            f"不传 --output 时写入 {display_path(DEFAULT_EXPORT_ALL_SUMMARY_PATH)}，"
             "如果文件已存在会跳过已导出的股票并从尾部追加。"
         ),
     )

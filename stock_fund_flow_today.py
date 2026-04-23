@@ -24,7 +24,10 @@ REQUEST_TIMEOUT = 10
 FETCH_RETRY_TIMES = 3
 FETCH_RETRY_BASE_SLEEP = 0.8
 EASTMONEY_FUND_FLOW_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
-SYMBOL_CACHE_PATH = Path(__file__).with_name("stock_symbols_cache.json")
+PROJECT_DIR = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_DIR / "data"
+TODAY_DATA_DIR = DATA_DIR / "today"
+SYMBOL_CACHE_PATH = PROJECT_DIR / "stock_symbols_cache.json"
 DEFAULT_BATCH_SIZE = 80
 DEFAULT_DELAY = 0.2
 
@@ -54,7 +57,14 @@ def default_date_tag() -> str:
 
 
 def default_output_path(date_tag: str) -> Path:
-    return Path(__file__).with_name(f"{date_tag}.csv")
+    return TODAY_DATA_DIR / f"{date_tag}.csv"
+
+
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(PROJECT_DIR))
+    except ValueError:
+        return str(path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,7 +82,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        help="输出 CSV 文件；不传则写入 --date 对应的 MMDD.csv。",
+        help="输出 CSV 文件；不传则写入 data/today/ 下 --date 对应的 MMDD.csv。",
     )
     parser.add_argument(
         "--batch-size",
@@ -369,7 +379,7 @@ def main() -> None:
     print(
         f"开始导出当天实时主力资金流：文件日期 {date_tag}，"
         f"股票 {total} 只，已存在 {skipped} 只，待抓取 {len(pending_symbols)} 只，"
-        f"输出文件 {output_path}",
+        f"输出文件 {display_path(output_path)}",
         file=sys.stderr,
     )
 
@@ -405,7 +415,7 @@ def main() -> None:
             time.sleep(args.delay)
 
     print(
-        f"导出完成：本次新增 {success_count} 条，跳过 {skipped} 条，文件 {output_path}",
+        f"导出完成：本次新增 {success_count} 条，跳过 {skipped} 条，文件 {display_path(output_path)}",
         file=sys.stderr,
     )
 

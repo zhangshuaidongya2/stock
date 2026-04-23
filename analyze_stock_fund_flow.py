@@ -23,8 +23,10 @@ from pathlib import Path
 import pandas as pd
 
 
-DEFAULT_INPUT_PATH = Path(__file__).with_name("fund.csv")
-DEFAULT_OUTPUT_PATH = Path(__file__).with_name("stock_fund_flow_strong_inflow.csv")
+PROJECT_DIR = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_DIR / "data"
+DEFAULT_INPUT_PATH = DATA_DIR / "fund.csv"
+DEFAULT_OUTPUT_PATH = DATA_DIR / "stock_fund_flow_strong_inflow.csv"
 DEFAULT_DAYS = 30
 DEFAULT_MIN_NET_INFLOW_YI = 8.0
 DEFAULT_FORMAT = "csv"
@@ -58,14 +60,21 @@ OUTPUT_COLUMNS = [
 ]
 
 
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(PROJECT_DIR))
+    except ValueError:
+        return str(path)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="分析 fund.csv 多周期资金流汇总，按天数和主力净流入金额筛选股票。"
+        description="分析 data/fund.csv 多周期资金流汇总，按天数和主力净流入金额筛选股票。"
     )
     parser.add_argument(
         "--input",
         default=str(DEFAULT_INPUT_PATH),
-        help=f"输入 CSV 文件，默认 {DEFAULT_INPUT_PATH.name}。",
+        help=f"输入 CSV 文件，默认 {display_path(DEFAULT_INPUT_PATH)}。",
     )
     parser.add_argument(
         "--days",
@@ -101,7 +110,7 @@ def parse_args() -> argparse.Namespace:
         "--output",
         help=(
             "输出文件路径。普通筛选模式默认 "
-            f"{DEFAULT_OUTPUT_PATH.name}；指定 --code 时默认打印到终端。"
+            f"{display_path(DEFAULT_OUTPUT_PATH)}；指定 --code 时默认打印到终端。"
         ),
     )
     return parser.parse_args()

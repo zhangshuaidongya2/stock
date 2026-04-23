@@ -19,6 +19,9 @@ from typing import Any
 import pandas as pd
 
 
+PROJECT_DIR = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_DIR / "data"
+TODAY_DATA_DIR = DATA_DIR / "today"
 DEFAULT_TOP = 10
 
 RANK_COLUMNS = [
@@ -44,7 +47,14 @@ def default_date_tag() -> str:
 
 
 def default_input_path(date_tag: str) -> Path:
-    return Path(__file__).with_name(f"{date_tag}.csv")
+    return TODAY_DATA_DIR / f"{date_tag}.csv"
+
+
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(PROJECT_DIR))
+    except ValueError:
+        return str(path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--input",
-        help="输入 CSV 文件；不传则读取 --date 对应的 MMDD.csv。",
+        help="输入 CSV 文件；不传则读取 data/today/ 下 --date 对应的 MMDD.csv。",
     )
     parser.add_argument(
         "--top",
@@ -164,7 +174,7 @@ def build_report(
     title, column = rank_config(rank_by_name)
     return {
         "日期": date_tag,
-        "文件": input_path.name,
+        "文件": display_path(input_path),
         "top": top,
         "样本数": int(len(df)),
         "排行类型": rank_by_name,
