@@ -276,6 +276,53 @@ def append_rows_csv(df: Any, output_path: Path) -> None:
     df.to_csv(output_path, mode="a", index=False, header=write_header)
 
 
+def upsert_rows_csv(df: Any, output_path: Path) -> tuple[int, int]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        df.to_csv(output_path, index=False)
+        return 0, len(df)
+
+    try:
+        existing_df = pd.read_csv(output_path, dtype={"代码": str})
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"无法读取已有导出文件 {output_path}：{exc}") from exc
+
+    current_columns = list(existing_df.columns)
+    if current_columns != OUTPUT_COLUMNS:
+        raise SystemExit(
+            f"已有导出文件 {output_path} 的表头不是当前格式，"
+            "为避免更新错列，已停止。请先备份或处理旧文件。"
+        )
+
+    incoming_rows: dict[str, Any] = {}
+    for _, row in df.iterrows():
+        code = normalize_code(row.get("代码"))
+        if code:
+            incoming_rows[code] = row[OUTPUT_COLUMNS]
+
+    output_rows = []
+    replaced_count = 0
+    written_codes = set()
+    for _, row in existing_df.iterrows():
+        code = normalize_code(row.get("代码"))
+        if code in incoming_rows:
+            replaced_count += 1
+            if code not in written_codes:
+                output_rows.append(incoming_rows[code])
+                written_codes.add(code)
+            continue
+        output_rows.append(row[OUTPUT_COLUMNS])
+
+    for code, row in incoming_rows.items():
+        if code not in written_codes:
+            output_rows.append(row)
+            written_codes.add(code)
+
+    output_df = pd.DataFrame(output_rows, columns=OUTPUT_COLUMNS)
+    output_df.to_csv(output_path, index=False)
+    return replaced_count, len(incoming_rows)
+
+
 def chunks(items: list[dict[str, str]], size: int) -> list[list[dict[str, str]]]:
     return [items[index:index + size] for index in range(0, len(items), size)]
 
@@ -378,22 +425,40 @@ def main() -> None:
         print(f"已删除旧文件：{display_path(output_path)}", file=sys.stderr)
 
     symbols = resolve_symbols(args.code)
+    update_selected_codes = bool(args.code)
     exported_codes = read_exported_codes(output_path)
-    pending_symbols = [
-        symbol for symbol in symbols
-        if normalize_code(symbol["代码"]) not in exported_codes
-    ]
+    if update_selected_codes:
+        pending_symbols = symbols
+    else:
+        pending_symbols = [
+            symbol for symbol in symbols
+            if normalize_code(symbol["代码"]) not in exported_codes
+        ]
 
     total = len(symbols)
-    skipped = total - len(pending_symbols)
-    print(
-        f"开始导出当天实时主力资金流：文件日期 {date_tag}，"
-        f"股票 {total} 只，已存在 {skipped} 只，待抓取 {len(pending_symbols)} 只，"
-        f"输出文件 {display_path(output_path)}",
-        file=sys.stderr,
-    )
+    skipped = 0 if update_selected_codes else total - len(pending_symbols)
+    if update_selected_codes:
+        existing_selected = sum(
+            1
+            for symbol in symbols
+            if normalize_code(symbol["代码"]) in exported_codes
+        )
+        print(
+            f"开始更新指定股票当天实时主力资金流：文件日期 {date_tag}，"
+            f"股票 {total} 只，已有 {existing_selected} 只会覆盖，"
+            f"待抓取 {len(pending_symbols)} 只，输出文件 {display_path(output_path)}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"开始导出当天实时主力资金流：文件日期 {date_tag}，"
+            f"股票 {total} 只，已存在 {skipped} 只，待抓取 {len(pending_symbols)} 只，"
+            f"输出文件 {display_path(output_path)}",
+            file=sys.stderr,
+        )
 
     success_count = 0
+    replaced_count = 0
     batches = chunks(pending_symbols, args.batch_size)
     for index, batch in enumerate(batches, start=1):
         first = batch[0]
@@ -407,27 +472,46 @@ def main() -> None:
         try:
             records = fetch_today_fund_flow_batch(batch)
         except Exception as exc:  # noqa: BLE001
+            retry_hint = (
+                "修复或稍后重试后，会重新抓取并更新本次指定股票。"
+                if update_selected_codes
+                else "已写入的数据会保留，稍后重试会跳过当天已写入股票。"
+            )
             raise SystemExit(
                 f"[{index}/{len(batches)}] 获取失败：{type(exc).__name__}: {exc}\n"
-                "已停止导出；已写入的数据会保留，稍后重试会跳过当天已写入股票。"
+                f"已停止导出；{retry_hint}"
             ) from exc
 
         if records:
             output_df = pd.DataFrame(records, columns=OUTPUT_COLUMNS)
-            append_rows_csv(output_df, output_path)
+            if update_selected_codes:
+                batch_replaced_count, written_count = upsert_rows_csv(output_df, output_path)
+                replaced_count += batch_replaced_count
+                action = f"已更新 {written_count} 条，覆盖旧行 {batch_replaced_count} 条"
+            else:
+                append_rows_csv(output_df, output_path)
+                action = f"已写入 {len(records)} 条"
             success_count += len(records)
             print(
-                f"[{index}/{len(batches)}] 已写入 {len(records)} 条",
+                f"[{index}/{len(batches)}] {action}",
                 file=sys.stderr,
             )
 
         if args.delay > 0 and index < len(batches):
             time.sleep(args.delay)
 
-    print(
-        f"导出完成：本次新增 {success_count} 条，跳过 {skipped} 条，文件 {display_path(output_path)}",
-        file=sys.stderr,
-    )
+    if update_selected_codes:
+        print(
+            f"更新完成：本次抓取 {success_count} 条，覆盖旧行 {replaced_count} 条，"
+            f"文件 {display_path(output_path)}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"导出完成：本次新增 {success_count} 条，跳过 {skipped} 条，"
+            f"文件 {display_path(output_path)}",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":
