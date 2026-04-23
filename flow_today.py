@@ -2,9 +2,9 @@
 """Fetch today's A-share realtime main fund flow and append CSV.
 
 Examples:
-  python stock_fund_flow_today.py
-  python stock_fund_flow_today.py --code 000001,600519
-  python stock_fund_flow_today.py --date 0423
+  python flow_today.py
+  python flow_today.py --code 000001,600519
+  python flow_today.py --date 0423
 """
 
 from __future__ import annotations

@@ -2,13 +2,13 @@
 """Fetch A-share stock information triggered by market changes.
 
 Default run:
-  python stock_change_info.py
+  python stock_info.py
 
 Override examples:
-  python stock_change_info.py --code 000001,002342,600519 --history-days 30
-  python stock_change_info.py --quote-source auto --history-source auto
-  python stock_change_info.py --min-change 5 --top 20 --format table
-  python stock_change_info.py --min-change 4 --output result.csv --format csv
+  python stock_info.py --code 000001,002342,600519 --history-days 30
+  python stock_info.py --quote-source auto --history-source auto
+  python stock_info.py --min-change 5 --top 20 --format table
+  python stock_info.py --min-change 4 --output result.csv --format csv
 """
 
 from __future__ import annotations
