@@ -5,6 +5,7 @@ Examples:
   python grap_flow_today.py
   python grap_flow_today.py --code 000001,600519
   python grap_flow_today.py --date 0423
+  python grap_flow_today.py --date 0423 --recreate
 """
 
 from __future__ import annotations
@@ -83,6 +84,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         help="输出 CSV 文件；不传则写入 data/today/ 下 --date 对应的 MMDD.csv。",
+    )
+    parser.add_argument(
+        "--recreate",
+        action="store_true",
+        help="抓取前删除已有输出文件并重新创建。",
     )
     parser.add_argument(
         "--batch-size",
@@ -367,6 +373,10 @@ def main() -> None:
 
     date_tag = normalize_date_tag(args.date)
     output_path = Path(args.output) if args.output else default_output_path(date_tag)
+    if args.recreate and output_path.exists():
+        output_path.unlink()
+        print(f"已删除旧文件：{display_path(output_path)}", file=sys.stderr)
+
     symbols = resolve_symbols(args.code)
     exported_codes = read_exported_codes(output_path)
     pending_symbols = [
