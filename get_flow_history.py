@@ -2,13 +2,13 @@
 """Fetch A-share main fund flow history.
 
 Examples:
-  python flow_history.py
-  python flow_history.py --symbols 000001,600519 --days 10
-  python flow_history.py --symbols 平安银行,贵州茅台 --days 20
-  python flow_history.py --symbols 000001 --days 10 --no-details
-  python flow_history.py --symbols 000001 --days 10 --details
-  python flow_history.py --symbols 300750 --days 30 --output fund_flow.csv --format csv
-  python flow_history.py --export-all-summary
+  python get_flow_history.py
+  python get_flow_history.py --symbols 000001,600519 --days 10
+  python get_flow_history.py --symbols 平安银行,贵州茅台 --days 20
+  python get_flow_history.py --symbols 000001 --days 10 --no-details
+  python get_flow_history.py --symbols 000001 --days 10 --details
+  python get_flow_history.py --symbols 300750 --days 30 --output fund_flow.csv --format csv
+  python get_flow_history.py --export-all-summary
 
 Default JSON output contains 结论 only. Set DEFAULT_SHOW_DETAILS=True or pass
 --details to include daily fund-flow records.

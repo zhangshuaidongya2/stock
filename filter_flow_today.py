@@ -2,14 +2,14 @@
 """Analyze exported stock fund-flow summary CSV.
 
 Examples:
-  python flow_filter.py
-  python flow_filter.py --days 15 --money 10
-  python flow_filter.py --days 15 --money 10 --max-change 5
-  python flow_filter.py --days 7 --money 5
-  python flow_filter.py --days 3 --format table
-  python flow_filter.py --days 30 --output strong_inflow.json
-  python flow_filter.py --code 000001
-  python flow_filter.py --input data/fund.csv --code 000001
+  python filter_flow_today.py
+  python filter_flow_today.py --days 15 --money 10
+  python filter_flow_today.py --days 15 --money 10 --max-change 5
+  python filter_flow_today.py --days 7 --money 5
+  python filter_flow_today.py --days 3 --format table
+  python filter_flow_today.py --days 30 --output strong_inflow.json
+  python filter_flow_today.py --code 000001
+  python filter_flow_today.py --input data/fund.csv --code 000001
 """
 
 from __future__ import annotations

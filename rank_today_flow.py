@@ -2,10 +2,10 @@
 """Analyze today's realtime stock fund-flow CSV.
 
 Examples:
-  python flow_rank.py
-  python flow_rank.py --top 20
-  python flow_rank.py --rank-by super --top 20
-  python flow_rank.py --date 0423
+  python rank_today_flow.py
+  python rank_today_flow.py --top 20
+  python rank_today_flow.py --rank-by super --top 20
+  python rank_today_flow.py --date 0423
 """
 
 from __future__ import annotations
