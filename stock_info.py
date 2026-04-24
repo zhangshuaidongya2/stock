@@ -49,7 +49,7 @@ DEFAULT_RUN_CONFIG = {
     # 历史行情数据源：auto / eastmoney / sina。
     "history_source": "sina",
     # 历史摘要天数；0 表示不查询历史行情。
-    "history_days": 5,
+    "history_days": 0,
     # 输出条数上限；0 表示不过滤数量。
     "top": 0,
     # 输出格式：table / json / csv。
@@ -61,7 +61,7 @@ DEFAULT_RUN_CONFIG = {
     # 主力资金流模式：realtime / daily / auto。
     "fund_flow_mode": "realtime",
     # 是否计算支撑位/压力位。
-    "support_resistance": True,
+    "support_resistance": False,
     # 支撑位/压力位分析回看天数。
     "sr_days": 120,
     # 支撑位/压力位返回层数。
@@ -69,19 +69,19 @@ DEFAULT_RUN_CONFIG = {
     # 局部高低点识别窗口（交易日）。
     "sr_pivot_window": 3,
     # 是否计算扩展技术因子。
-    "advanced_factors": True,
+    "advanced_factors": False,
     # 扩展技术因子分析回看天数。
     "factor_days": 120,
     # 是否计算方向概率判断。
-    "predict_direction": True,
+    "predict_direction": False,
     # 方向判断的最小概率优势（超过 50% 的最小百分点）。
     "predict_min_edge": 16.0,
     # 是否输出买卖点建议。
-    "trade_decision": True,
+    "trade_decision": False,
     # 买卖点判定最小得分阈值。
     "trade_min_score": 4.0,
     # 是否输出历史回测命中统计。
-    "backtest_hit_rate": True,
+    "backtest_hit_rate": False,
     # 回测信号统计窗口（交易日）。
     "backtest_days": 120,
     # 回测信号持有周期（交易日）。
