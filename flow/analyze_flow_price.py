@@ -2,9 +2,9 @@
 """Analyze flow.csv and price.csv, then print JSON to stdout.
 
 Examples:
-  python analyze_flow_price.py
-  python analyze_flow_price.py --days 3 --money 2
-  python analyze_flow_price.py --days 5 --money 1.5 --max-change 8 --top 20
+  python flow/analyze_flow_price.py
+  python flow/analyze_flow_price.py --days 3 --money 2
+  python flow/analyze_flow_price.py --days 5 --money 1.5 --max-change 8 --top 20
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Any
 import pandas as pd
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_DIR / "data"
 DEFAULT_FLOW_PATH = DATA_DIR / "flow.csv"
 DEFAULT_PRICE_PATH = DATA_DIR / "price.csv"
@@ -32,6 +32,13 @@ def display_path(path: Path) -> str:
         return str(path.relative_to(PROJECT_DIR))
     except ValueError:
         return str(path)
+
+
+def resolve_project_path(path: str | Path) -> Path:
+    resolved_path = Path(path)
+    if resolved_path.is_absolute():
+        return resolved_path
+    return PROJECT_DIR / resolved_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,6 +103,7 @@ def date_columns(df: pd.DataFrame) -> list[str]:
 
 
 def read_matrix(path: Path) -> pd.DataFrame:
+    path = resolve_project_path(path)
     if not path.exists():
         raise SystemExit(f"输入文件不存在：{path}")
     try:

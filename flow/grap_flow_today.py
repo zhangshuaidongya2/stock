@@ -2,10 +2,10 @@
 """Fetch today's A-share realtime main fund flow and append CSV.
 
 Examples:
-  python grap_flow_today.py
-  python grap_flow_today.py --code 000001,600519
-  python grap_flow_today.py --date 0423
-  python grap_flow_today.py --date 0423 --recreate
+  python flow/grap_flow_today.py
+  python flow/grap_flow_today.py --code 000001,600519
+  python flow/grap_flow_today.py --date 0423
+  python flow/grap_flow_today.py --date 0423 --recreate
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ REQUEST_TIMEOUT = 10
 FETCH_RETRY_TIMES = 3
 FETCH_RETRY_BASE_SLEEP = 0.8
 EASTMONEY_FUND_FLOW_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_DIR / "data"
 TODAY_DATA_DIR = DATA_DIR / "today"
 SYMBOL_CACHE_PATH = PROJECT_DIR / "stock_symbols_cache.json"
@@ -66,6 +66,13 @@ def display_path(path: Path) -> str:
         return str(path.relative_to(PROJECT_DIR))
     except ValueError:
         return str(path)
+
+
+def resolve_project_path(path: str | Path) -> Path:
+    resolved_path = Path(path)
+    if resolved_path.is_absolute():
+        return resolved_path
+    return PROJECT_DIR / resolved_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -419,7 +426,7 @@ def main() -> None:
     require_dependencies()
 
     date_tag = normalize_date_tag(args.date)
-    output_path = Path(args.output) if args.output else default_output_path(date_tag)
+    output_path = resolve_project_path(args.output) if args.output else default_output_path(date_tag)
     if args.recreate and output_path.exists():
         output_path.unlink()
         print(f"已删除旧文件：{display_path(output_path)}", file=sys.stderr)

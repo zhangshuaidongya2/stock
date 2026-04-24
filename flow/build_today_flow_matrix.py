@@ -2,9 +2,9 @@
 """Build stock-by-day matrices from data/today/*.csv.
 
 Examples:
-  python build_today_flow_matrix.py
-  python build_today_flow_matrix.py --input-dir data/today
-  python build_today_flow_matrix.py --flow-output data/flow.csv --price-output data/price.csv
+  python flow/build_today_flow_matrix.py
+  python flow/build_today_flow_matrix.py --input-dir data/today
+  python flow/build_today_flow_matrix.py --flow-output data/flow.csv --price-output data/price.csv
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from pathlib import Path
 import pandas as pd
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_DIR / "data"
 TODAY_DATA_DIR = DATA_DIR / "today"
 DEFAULT_FLOW_OUTPUT_PATH = DATA_DIR / "flow.csv"
@@ -30,6 +30,13 @@ def display_path(path: Path) -> str:
         return str(path.relative_to(PROJECT_DIR))
     except ValueError:
         return str(path)
+
+
+def resolve_project_path(path: str | Path) -> Path:
+    resolved_path = Path(path)
+    if resolved_path.is_absolute():
+        return resolved_path
+    return PROJECT_DIR / resolved_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -152,9 +159,9 @@ def write_output(df: pd.DataFrame, output_path: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    input_dir = Path(args.input_dir)
-    flow_output_path = Path(args.flow_output)
-    price_output_path = Path(args.price_output)
+    input_dir = resolve_project_path(args.input_dir)
+    flow_output_path = resolve_project_path(args.flow_output)
+    price_output_path = resolve_project_path(args.price_output)
 
     files = list_daily_files(input_dir)
     merged_df = read_all_snapshots(files)
