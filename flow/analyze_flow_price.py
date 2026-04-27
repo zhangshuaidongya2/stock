@@ -25,6 +25,8 @@ DEFAULT_PRICE_PATH = DATA_DIR / "price.csv"
 DATE_TAG_PATTERN = re.compile(r"^\d{4}$")
 DEFAULT_DAYS = 1
 DEFAULT_THRESHOLD_YI = 1.0
+WINDOW_NET_INFLOW_SUM_FIELD = "最近N天主力净流入合计(万)"
+WINDOW_POSITIVE_DAYS_FIELD = "最近N天净流入为正天数"
 
 
 def display_path(path: Path) -> str:
@@ -45,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "分析 data/flow.csv 和 data/price.csv，"
-            "输出最近 N 天主力净流入和价格变化的 JSON 结果。"
+            "输出指定天数主力净流入和价格变化的 JSON 结果。"
         )
     )
     parser.add_argument(
@@ -68,7 +70,7 @@ def parse_args() -> argparse.Namespace:
         "--money",
         type=float,
         default=DEFAULT_THRESHOLD_YI,
-        help=f"最近 N 天主力净流入合计阈值，单位亿元，默认 {DEFAULT_THRESHOLD_YI:g}。",
+        help=f"指定天数主力净流入合计阈值，单位亿元，默认 {DEFAULT_THRESHOLD_YI:g}。",
     )
     parser.add_argument(
         "--top",
@@ -80,7 +82,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         help=(
             "区间涨幅上限，单位百分比。"
-            "例如 5 表示只保留最近 N 天主力净流入合计超过阈值，"
+            "例如 5 表示只保留指定天数主力净流入合计超过阈值，"
             "且区间涨跌幅不超过 5%% 的股票。"
         ),
     )
@@ -193,13 +195,19 @@ def build_daily_map(row: pd.Series, selected_dates: list[str], suffix: str) -> d
     }
 
 
-def build_record(row: pd.Series, selected_dates: list[str]) -> dict[str, Any]:
+def window_label(days: int) -> str:
+    return f"最近{days}天"
+
+
+def build_record(row: pd.Series, selected_dates: list[str], days: int | None = None) -> dict[str, Any]:
     start_date = selected_dates[0]
     end_date = selected_dates[-1]
     start_price = row.get(f"{start_date}_price")
     end_price = row.get(f"{end_date}_price")
-    net_inflow_wan = row.get("最近N天主力净流入合计(万)")
-    positive_days = row.get("最近N天净流入为正天数")
+    net_inflow_wan = row.get(WINDOW_NET_INFLOW_SUM_FIELD)
+    positive_days = row.get(WINDOW_POSITIVE_DAYS_FIELD)
+    current_days = len(selected_dates) if days is None else days
+    label = window_label(current_days)
 
     price_change_pct = round_or_none(row.get("区间涨跌幅%"))
     if price_change_pct is None:
@@ -216,13 +224,13 @@ def build_record(row: pd.Series, selected_dates: list[str]) -> dict[str, Any]:
         "区间起始价格": round_or_none(start_price),
         "最新价格": round_or_none(end_price),
         "区间涨跌幅%": price_change_pct,
-        "最近N天主力净流入合计(万)": round_or_none(net_inflow_wan),
-        "最近N天主力净流入合计(亿)": round_or_none(
+        f"{label}主力净流入合计(万)": round_or_none(net_inflow_wan),
+        f"{label}主力净流入合计(亿)": round_or_none(
             None if net_inflow_wan is None or pd.isna(net_inflow_wan) else float(net_inflow_wan) / 10000
         ),
-        "最近N天净流入为正天数": int(positive_days) if pd.notna(positive_days) else None,
-        "最近N天每日净流入(万)": build_daily_map(row, selected_dates, "flow"),
-        "最近N天每日价格": build_daily_map(row, selected_dates, "price"),
+        f"{label}净流入为正天数": int(positive_days) if pd.notna(positive_days) else None,
+        f"{label}每日净流入(万)": build_daily_map(row, selected_dates, "flow"),
+        f"{label}每日价格": build_daily_map(row, selected_dates, "price"),
     }
 
 
@@ -239,10 +247,10 @@ def build_working_df(merged_df: pd.DataFrame, selected_dates: list[str]) -> pd.D
     working_df = merged_df[full_window_mask].copy()
 
     if working_df.empty:
-        raise SystemExit("最近 N 天没有同时具备完整流向和价格数据的股票。")
+        raise SystemExit(f"最近{len(selected_dates)}天没有同时具备完整流向和价格数据的股票。")
 
-    working_df["最近N天主力净流入合计(万)"] = working_df[flow_columns].sum(axis=1)
-    working_df["最近N天净流入为正天数"] = working_df[flow_columns].gt(0).sum(axis=1)
+    working_df[WINDOW_NET_INFLOW_SUM_FIELD] = working_df[flow_columns].sum(axis=1)
+    working_df[WINDOW_POSITIVE_DAYS_FIELD] = working_df[flow_columns].gt(0).sum(axis=1)
     start_date = selected_dates[0]
     end_date = selected_dates[-1]
     start_prices = working_df[f"{start_date}_price"]
@@ -255,34 +263,36 @@ def build_working_df(merged_df: pd.DataFrame, selected_dates: list[str]) -> pd.D
 def analyze(merged_df: pd.DataFrame, selected_dates: list[str], threshold_yi: float, top: int | None) -> dict[str, Any]:
     working_df = build_working_df(merged_df, selected_dates)
     flow_columns = [f"{date_tag}_flow" for date_tag in selected_dates]
+    days = len(selected_dates)
+    label = window_label(days)
 
     threshold_wan = threshold_yi * 10000
-    threshold_df = working_df[working_df["最近N天主力净流入合计(万)"] > threshold_wan].copy()
-    threshold_df = threshold_df.sort_values("最近N天主力净流入合计(万)", ascending=False)
+    threshold_df = working_df[working_df[WINDOW_NET_INFLOW_SUM_FIELD] > threshold_wan].copy()
+    threshold_df = threshold_df.sort_values(WINDOW_NET_INFLOW_SUM_FIELD, ascending=False)
 
     continuous_df = working_df[working_df[flow_columns].gt(0).all(axis=1)].copy()
-    continuous_df = continuous_df.sort_values("最近N天主力净流入合计(万)", ascending=False)
+    continuous_df = continuous_df.sort_values(WINDOW_NET_INFLOW_SUM_FIELD, ascending=False)
 
-    threshold_records = [build_record(row, selected_dates) for _, row in threshold_df.iterrows()]
-    continuous_records = [build_record(row, selected_dates) for _, row in continuous_df.iterrows()]
+    threshold_records = [build_record(row, selected_dates, days) for _, row in threshold_df.iterrows()]
+    continuous_records = [build_record(row, selected_dates, days) for _, row in continuous_df.iterrows()]
 
     return {
         "分析参数": {
-            "最近天数": len(selected_dates),
+            "最近天数": days,
             "日期范围": selected_dates,
             "主力净流入阈值(亿)": threshold_yi,
         },
         "筛选说明": {
-            "条件1": "独立筛选：最近N天主力净流入合计超过阈值",
-            "条件2": "独立筛选：最近N天每天主力净流入都大于0",
+            "条件1": f"独立筛选：{label}主力净流入合计超过阈值",
+            "条件2": f"独立筛选：{label}每天主力净流入都大于0",
         },
         "样本信息": {
             "完整样本数": int(len(working_df)),
             "主力净流入合计超过阈值个数": int(len(threshold_df)),
-            "最近N天每天净流入都大于0个数": int(len(continuous_df)),
+            f"{label}每天净流入都大于0个数": int(len(continuous_df)),
         },
-        "最近N天主力净流入合计超过阈值": limit_records(threshold_records, top),
-        "最近N天每天主力净流入都大于0": limit_records(continuous_records, top),
+        f"{label}主力净流入合计超过阈值": limit_records(threshold_records, top),
+        f"{label}每天主力净流入都大于0": limit_records(continuous_records, top),
     }
 
 
@@ -300,19 +310,21 @@ def analyze_with_max_change(
         top=top,
     )
     working_df = build_working_df(merged_df, selected_dates)
+    days = len(selected_dates)
+    label = window_label(days)
 
     threshold_wan = threshold_yi * 10000
     max_change_df = working_df[
-        (working_df["最近N天主力净流入合计(万)"] > threshold_wan)
+        (working_df[WINDOW_NET_INFLOW_SUM_FIELD] > threshold_wan)
         & working_df["区间涨跌幅%"].notna()
         & (working_df["区间涨跌幅%"] <= max_change)
     ].copy()
-    max_change_df = max_change_df.sort_values("最近N天主力净流入合计(万)", ascending=False)
-    max_change_records = [build_record(row, selected_dates) for _, row in max_change_df.iterrows()]
+    max_change_df = max_change_df.sort_values(WINDOW_NET_INFLOW_SUM_FIELD, ascending=False)
+    max_change_records = [build_record(row, selected_dates, days) for _, row in max_change_df.iterrows()]
 
     base_result["分析参数"]["区间涨幅上限%"] = max_change
     base_result["样本信息"]["主力净流入合计超过阈值且区间涨幅不超过上限个数"] = int(len(max_change_df))
-    base_result["最近N天主力净流入合计超过阈值且区间涨幅不超过上限"] = limit_records(
+    base_result[f"{label}主力净流入合计超过阈值且区间涨幅不超过上限"] = limit_records(
         max_change_records,
         top,
     )

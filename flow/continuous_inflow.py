@@ -17,12 +17,14 @@ from typing import Any
 from analyze_flow_price import (
     DEFAULT_FLOW_PATH,
     DEFAULT_PRICE_PATH,
+    WINDOW_NET_INFLOW_SUM_FIELD,
     build_merged_window,
     build_record,
     build_working_df,
     display_path,
     read_matrix,
     select_dates,
+    window_label,
 )
 
 
@@ -30,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "分析 data/flow.csv 和 data/price.csv，"
-            "输出最近 N 天每天主力净流入都大于 0 的股票 JSON。"
+            "输出指定天数每天主力净流入都大于 0 的股票 JSON。"
         )
     )
     parser.add_argument(
@@ -73,23 +75,25 @@ def main() -> None:
     selected_dates = select_dates(flow_df, price_df, args.days)
     merged_df = build_merged_window(flow_df, price_df, selected_dates)
     working_df = build_working_df(merged_df, selected_dates)
+    days = len(selected_dates)
+    label = window_label(days)
 
     flow_columns = [f"{date_tag}_flow" for date_tag in selected_dates]
     continuous_df = working_df[working_df[flow_columns].gt(0).all(axis=1)].copy()
-    continuous_df = continuous_df.sort_values("最近N天主力净流入合计(万)", ascending=False)
+    continuous_df = continuous_df.sort_values(WINDOW_NET_INFLOW_SUM_FIELD, ascending=False)
 
-    records = [build_record(row, selected_dates) for _, row in continuous_df.iterrows()]
+    records = [build_record(row, selected_dates, days) for _, row in continuous_df.iterrows()]
     result = {
         "分析参数": {
-            "最近天数": len(selected_dates),
+            "最近天数": days,
             "日期范围": selected_dates,
         },
-        "筛选说明": "独立筛选：最近N天每天主力净流入都大于0",
+        "筛选说明": f"独立筛选：{label}每天主力净流入都大于0",
         "样本信息": {
             "完整样本数": int(len(working_df)),
             "命中个数": int(len(continuous_df)),
         },
-        "最近N天每天主力净流入都大于0": limit_records(records, args.top),
+        f"{label}每天主力净流入都大于0": limit_records(records, args.top),
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

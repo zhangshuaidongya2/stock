@@ -18,12 +18,14 @@ from analyze_flow_price import (
     DEFAULT_FLOW_PATH,
     DEFAULT_PRICE_PATH,
     DEFAULT_THRESHOLD_YI,
+    WINDOW_NET_INFLOW_SUM_FIELD,
     build_merged_window,
     build_record,
     build_working_df,
     display_path,
     read_matrix,
     select_dates,
+    window_label,
 )
 
 
@@ -31,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "分析 data/flow.csv 和 data/price.csv，"
-            "输出最近 N 天主力净流入合计超过阈值的股票 JSON。"
+            "输出指定天数主力净流入合计超过阈值的股票 JSON。"
         )
     )
     parser.add_argument(
@@ -54,7 +56,7 @@ def parse_args() -> argparse.Namespace:
         "--money",
         type=float,
         default=DEFAULT_THRESHOLD_YI,
-        help=f"最近 N 天主力净流入合计阈值，单位亿元，默认 {DEFAULT_THRESHOLD_YI:g}。",
+        help=f"指定天数主力净流入合计阈值，单位亿元，默认 {DEFAULT_THRESHOLD_YI:g}。",
     )
     parser.add_argument(
         "--top",
@@ -82,24 +84,26 @@ def main() -> None:
     selected_dates = select_dates(flow_df, price_df, args.days)
     merged_df = build_merged_window(flow_df, price_df, selected_dates)
     working_df = build_working_df(merged_df, selected_dates)
+    days = len(selected_dates)
+    label = window_label(days)
 
     threshold_wan = args.money * 10000
-    threshold_df = working_df[working_df["最近N天主力净流入合计(万)"] > threshold_wan].copy()
-    threshold_df = threshold_df.sort_values("最近N天主力净流入合计(万)", ascending=False)
+    threshold_df = working_df[working_df[WINDOW_NET_INFLOW_SUM_FIELD] > threshold_wan].copy()
+    threshold_df = threshold_df.sort_values(WINDOW_NET_INFLOW_SUM_FIELD, ascending=False)
 
-    records = [build_record(row, selected_dates) for _, row in threshold_df.iterrows()]
+    records = [build_record(row, selected_dates, days) for _, row in threshold_df.iterrows()]
     result = {
         "分析参数": {
-            "最近天数": len(selected_dates),
+            "最近天数": days,
             "日期范围": selected_dates,
             "主力净流入阈值(亿)": args.money,
         },
-        "筛选说明": "独立筛选：最近N天主力净流入合计超过阈值",
+        "筛选说明": f"独立筛选：{label}主力净流入合计超过阈值",
         "样本信息": {
             "完整样本数": int(len(working_df)),
             "命中个数": int(len(threshold_df)),
         },
-        "最近N天主力净流入合计超过阈值": limit_records(records, args.top),
+        f"{label}主力净流入合计超过阈值": limit_records(records, args.top),
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
