@@ -1975,7 +1975,7 @@ def fetch_fund_flow_realtime(code: str) -> dict[str, Any]:
         "中单净占比%": round_or_none(latest.get("f81")),
         "小单净流入(万)": scale_or_none(latest.get("f84"), 10000),
         "小单净占比%": round_or_none(latest.get("f87")),
-        "资金流来源": "东方财富-实时",
+        # "资金流来源": "东方财富-实时",
     }
 
     flow_time = safe_float(latest.get("f124"))
@@ -2134,7 +2134,7 @@ def build_record(ak: Any, row: Any, args: argparse.Namespace) -> dict[str, Any]:
     record = {
         "代码": code,
         "名称": row.get("名称"),
-        "变化信号": build_signal(row, args),
+        # "变化信号": build_signal(row, args),
         "行情来源": row.get("行情来源"),
         "最新价": round_or_none(row.get("最新价")),
         "涨跌幅%": round_or_none(row.get("涨跌幅")),
