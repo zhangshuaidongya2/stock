@@ -32,6 +32,8 @@ DATA_DIR = PROJECT_DIR / "data"
 TODAY_DATA_DIR = DATA_DIR / "today"
 SYMBOL_CACHE_PATH = PROJECT_DIR / "stock_symbols_cache.json"
 DEFAULT_DELAY = 0.2
+DEFAULT_PAUSE_EVERY = 0
+DEFAULT_PAUSE_SECONDS = 120
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
 OUTPUT_COLUMNS = [
@@ -135,6 +137,21 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_DELAY,
         help=f"每只股票之间等待秒数，默认 {DEFAULT_DELAY}。",
+    )
+    parser.add_argument(
+        "--pause-every",
+        type=int,
+        default=DEFAULT_PAUSE_EVERY,
+        help=(
+            "每抓取多少只股票后长暂停一次；小于等于 0 表示不长暂停，"
+            f"默认 {DEFAULT_PAUSE_EVERY}。"
+        ),
+    )
+    parser.add_argument(
+        "--pause-seconds",
+        type=float,
+        default=DEFAULT_PAUSE_SECONDS,
+        help=f"长暂停秒数，默认 {DEFAULT_PAUSE_SECONDS}。",
     )
     return parser.parse_args()
 
@@ -479,6 +496,8 @@ def main() -> None:
     args = parse_args()
     if args.delay < 0:
         raise SystemExit("--delay 不能小于 0")
+    if args.pause_seconds < 0:
+        raise SystemExit("--pause-seconds 不能小于 0")
 
     require_dependencies()
 
@@ -501,13 +520,11 @@ def main() -> None:
         target_date: read_exported_codes(output_path)
         for target_date, output_path in output_paths.items()
     }
+    processed_codes = set().union(*exported_codes_by_date.values())
     pending_symbols = []
     for symbol in symbols:
         code = normalize_code(symbol["代码"])
-        if update_selected_codes or any(
-            code not in exported_codes
-            for exported_codes in exported_codes_by_date.values()
-        ):
+        if update_selected_codes or code not in processed_codes:
             pending_symbols.append(symbol)
 
     total = len(symbols)
@@ -523,7 +540,7 @@ def main() -> None:
     else:
         print(
             f"开始补录历史资金流：日期 {date_text}，"
-            f"股票 {total} 只，已全部存在 {skipped} 只，"
+            f"股票 {total} 只，任一目标日期已存在 {skipped} 只，"
             f"待抓取 {len(pending_symbols)} 只，输出文件 {file_text}",
             file=sys.stderr,
         )
@@ -533,6 +550,7 @@ def main() -> None:
     missing_by_date = {target_date: 0 for target_date in target_dates}
 
     target_keys = {target_date: history_date_key(target_date) for target_date in target_dates}
+    fetched_count = 0
     for index, symbol in enumerate(pending_symbols, start=1):
         code = normalize_code(symbol["代码"])
         name = symbol.get("名称", "")
@@ -556,6 +574,7 @@ def main() -> None:
                 f"{type(exc).__name__}: {exc}\n"
                 "已停止补录；已写入的数据会保留，稍后重试会跳过已写入股票。"
             ) from exc
+        fetched_count += 1
 
         fetch_time = datetime.now(CHINA_TZ).isoformat(timespec="seconds")
         records_by_date: dict[date, list[dict[str, Any]]] = {
@@ -596,8 +615,20 @@ def main() -> None:
                 file=sys.stderr,
             )
 
-        if args.delay > 0 and index < len(pending_symbols):
-            time.sleep(args.delay)
+        if index < len(pending_symbols):
+            should_long_pause = (
+                args.pause_every > 0
+                and args.pause_seconds > 0
+                and fetched_count % args.pause_every == 0
+            )
+            if should_long_pause:
+                print(
+                    f"已抓取 {fetched_count} 只股票，暂停 {args.pause_seconds:g} 秒后继续...",
+                    file=sys.stderr,
+                )
+                time.sleep(args.pause_seconds)
+            elif args.delay > 0:
+                time.sleep(args.delay)
 
     summary_parts = []
     for target_date in target_dates:
