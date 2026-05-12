@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from symbol_search import build_suggestion_message, search_symbol_records, symbol_records_from_rows
 
 from build_today_flow_matrix import (
     TODAY_DATA_DIR,
@@ -90,11 +91,22 @@ def read_all_snapshots(input_dir: Path) -> tuple[list[str], pd.DataFrame]:
 
 
 def resolve_stock_identity(all_df: pd.DataFrame, token: str) -> tuple[str, str]:
+    symbol_records = symbol_records_from_rows(
+        all_df[["代码", "名称"]].fillna("").astype(str).to_dict(orient="records")
+    )
     normalized_input_code = normalize_code(token)
     if normalized_input_code:
         matched = all_df[all_df["代码"].map(normalize_code) == normalized_input_code].copy()
         if matched.empty:
-            raise SystemExit(f"today 目录数据中未找到股票代码：{normalized_input_code}")
+            suggestions = search_symbol_records(symbol_records, token, top=8)
+            raise SystemExit(
+                build_suggestion_message(
+                    token,
+                    suggestions,
+                    not_found_prefix="today 目录数据中未找到股票：",
+                    include_reason=True,
+                )
+            )
         matched = matched.sort_values("日期", kind="stable")
         latest = matched.iloc[-1]
         return normalized_input_code, str(latest.get("名称", "")).strip()
@@ -102,7 +114,15 @@ def resolve_stock_identity(all_df: pd.DataFrame, token: str) -> tuple[str, str]:
     normalized_input_name = normalize_name(token)
     matched = all_df[all_df["名称"].map(normalize_name) == normalized_input_name].copy()
     if matched.empty:
-        raise SystemExit(f"today 目录数据中未找到股票名称：{token}")
+        suggestions = search_symbol_records(symbol_records, token, top=8)
+        raise SystemExit(
+            build_suggestion_message(
+                token,
+                suggestions,
+                not_found_prefix="today 目录数据中未找到股票：",
+                include_reason=True,
+            )
+        )
 
     candidates = (
         matched.sort_values(["日期", "代码"], kind="stable")

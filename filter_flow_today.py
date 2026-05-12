@@ -22,6 +22,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from flow.symbol_search import (
+    build_suggestion_message,
+    normalize_text as normalize_symbol_text,
+    search_symbol_records,
+    symbol_records_from_rows,
+)
+
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_DIR / "data"
@@ -239,13 +246,30 @@ def filter_strong_inflow(
 def find_stock_row(df: pd.DataFrame, code: str) -> pd.Series:
     if "代码" not in df.columns:
         raise SystemExit("CSV 缺少字段：代码")
+    symbol_records = symbol_records_from_rows(
+        df[["代码", "名称"]].fillna("").astype(str).to_dict(orient="records")
+    )
+
     normalized_target = normalize_code(code)
-    if not normalized_target:
-        raise SystemExit("请输入有效的股票代码，例如 000001。")
-    matched = df[df["代码"].map(normalize_code) == normalized_target]
-    if matched.empty:
-        raise SystemExit(f"CSV 未找到股票代码：{normalized_target}")
-    return matched.iloc[0]
+    if normalized_target:
+        matched = df[df["代码"].map(normalize_code) == normalized_target]
+        if not matched.empty:
+            return matched.iloc[0]
+    else:
+        normalized_name = normalize_symbol_text(code)
+        matched = df[df["名称"].map(normalize_symbol_text) == normalized_name]
+        if not matched.empty:
+            return matched.iloc[0]
+
+    suggestions = search_symbol_records(symbol_records, code, top=8)
+    raise SystemExit(
+        build_suggestion_message(
+            code,
+            suggestions,
+            not_found_prefix="CSV 未找到股票：",
+            include_reason=True,
+        )
+    )
 
 
 def flow_direction(net_inflow_wan: float | None) -> str:

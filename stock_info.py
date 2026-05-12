@@ -22,6 +22,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from flow.symbol_search import (
+    build_suggestion_message,
+    search_symbol_records,
+    symbol_records_from_name_map,
+    symbol_records_from_rows,
+)
+
 
 pd = None
 
@@ -531,26 +538,36 @@ def symbols_are_codes(symbols: str) -> bool:
     return bool(tokens) and all(any(ch.isdigit() for ch in token) for token in tokens)
 
 
-def resolve_symbol_tokens(symbols: str) -> tuple[list[str], list[str]]:
+def resolve_symbol_tokens(
+    symbols: str,
+) -> tuple[list[str], list[tuple[str, list[dict[str, Any]]]]]:
     tokens = [item.strip() for item in symbols.split(",") if item.strip()]
     resolved_codes = []
-    unresolved_names = []
+    unresolved_tokens = []
 
-    name_map = None
+    name_map = load_symbol_name_map()
+    code_name_map = {code: name for name, code in name_map.items()}
+    symbol_records = symbol_records_from_name_map(name_map)
     for token in tokens:
         if any(ch.isdigit() for ch in token):
-            resolved_codes.append(normalize_code(token))
+            normalized_code = normalize_code(token)
+            if normalized_code in code_name_map:
+                resolved_codes.append(normalized_code)
+            else:
+                unresolved_tokens.append(
+                    (token, search_symbol_records(symbol_records, token, top=6))
+                )
             continue
 
-        if name_map is None:
-            name_map = load_symbol_name_map()
         code = name_map.get(token)
         if code:
             resolved_codes.append(code)
         else:
-            unresolved_names.append(token)
+            unresolved_tokens.append(
+                (token, search_symbol_records(symbol_records, token, top=6))
+            )
 
-    return resolved_codes, unresolved_names
+    return resolved_codes, unresolved_tokens
 
 
 def load_symbol_name_map() -> dict[str, str]:
@@ -710,9 +727,21 @@ def fetch_akshare_sina_spot_quotes(ak: Any) -> Any:
 def fetch_tencent_spot_quotes(symbols: str) -> Any:
     import requests
 
-    resolved_codes, unresolved_names = resolve_symbol_tokens(symbols)
+    resolved_codes, unresolved_tokens = resolve_symbol_tokens(symbols)
     query_symbols = [to_tencent_symbol(code) for code in resolved_codes]
     if not query_symbols:
+        if unresolved_tokens:
+            raise RuntimeError(
+                "\n\n".join(
+                    build_suggestion_message(
+                        token,
+                        matches,
+                        not_found_prefix="未找到股票：",
+                        include_reason=True,
+                    )
+                    for token, matches in unresolved_tokens
+                )
+            )
         raise RuntimeError("未能解析出可查询的股票代码")
 
     response = requests.get(
@@ -759,8 +788,18 @@ def fetch_tencent_spot_quotes(symbols: str) -> Any:
             }
         )
 
-    if unresolved_names:
-        print(f"提示：未找到这些股票名称：{','.join(unresolved_names)}", file=sys.stderr)
+    if unresolved_tokens:
+        for token, matches in unresolved_tokens:
+            print(
+                "提示："
+                + build_suggestion_message(
+                    token,
+                    matches,
+                    not_found_prefix="未找到股票：",
+                    include_reason=True,
+                ),
+                file=sys.stderr,
+            )
     if not records:
         raise RuntimeError("腾讯未返回可解析行情")
     return pd.DataFrame(records)
@@ -796,20 +835,53 @@ def filter_by_symbols(df: Any, symbols: str) -> Any:
         return df
 
     mask = pd.Series(False, index=df.index)
-    name_map = None
+    code_series = df["代码"].astype(str).str.zfill(6)
+    name_series = df["名称"].astype(str)
+    name_map = read_symbol_cache()
+    symbol_records = symbol_records_from_name_map(name_map)
+    if not symbol_records:
+        symbol_records = symbol_records_from_rows(
+            df[["代码", "名称"]].fillna("").astype(str).to_dict(orient="records")
+        )
+    unresolved_tokens = []
     for token in tokens:
+        matched = False
         if any(ch.isdigit() for ch in token):
-            mask |= df["代码"].astype(str).str.zfill(6) == normalize_code(token)
+            token_mask = code_series == normalize_code(token)
+            if token_mask.any():
+                mask |= token_mask
+                matched = True
         else:
-            name_mask = df["名称"].astype(str).str.contains(token, case=False, na=False)
+            name_mask = name_series.str.contains(token, case=False, na=False)
             if name_mask.any():
                 mask |= name_mask
+                matched = True
                 continue
-            if name_map is None:
-                name_map = read_symbol_cache()
             code = name_map.get(token, "")
             if code:
-                mask |= df["代码"].astype(str).str.zfill(6) == code
+                token_mask = code_series == code
+                if token_mask.any():
+                    mask |= token_mask
+                    matched = True
+        if not matched:
+            unresolved_tokens.append(
+                (
+                    token,
+                    search_symbol_records(symbol_records, token, top=6),
+                )
+            )
+    if unresolved_tokens:
+        raise RuntimeError(
+            "\n\n".join(
+                build_suggestion_message(
+                    token,
+                    matches,
+                    not_found_prefix="未找到股票：",
+                    include_reason=True,
+                )
+                for token, matches in unresolved_tokens
+            )
+        )
     return df[mask].copy()
 
 

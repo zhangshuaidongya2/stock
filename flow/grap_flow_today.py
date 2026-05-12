@@ -17,6 +17,11 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from symbol_search import (
+    build_suggestion_message,
+    search_symbol_records,
+    symbol_records_from_name_map,
+)
 
 
 pd = None
@@ -228,12 +233,16 @@ def resolve_symbols(code_arg: str | None) -> list[dict[str, str]]:
 
     name_map = read_symbol_cache()
     code_name_map = {code: name for name, code in name_map.items()}
+    symbol_records = symbol_records_from_name_map(name_map)
     resolved = []
     unresolved = []
     for token in tokens:
         code = normalize_code(token)
         if code and any(ch.isdigit() for ch in token):
-            resolved.append({"代码": code, "名称": code_name_map.get(code, "")})
+            if code in code_name_map:
+                resolved.append({"代码": code, "名称": code_name_map.get(code, "")})
+            else:
+                unresolved.append(token)
             continue
 
         cached_code = name_map.get(token)
@@ -243,11 +252,16 @@ def resolve_symbols(code_arg: str | None) -> list[dict[str, str]]:
             unresolved.append(token)
 
     if unresolved:
-        raise SystemExit(
-            "无法解析股票名称："
-            + "、".join(unresolved)
-            + "。请改用股票代码，或更新 stock_symbols_cache.json。"
-        )
+        messages = [
+            build_suggestion_message(
+                token,
+                search_symbol_records(symbol_records, token, top=6),
+                not_found_prefix="无法解析股票：",
+                include_reason=True,
+            )
+            for token in unresolved
+        ]
+        raise SystemExit("\n\n".join(messages))
     return resolved
 
 
