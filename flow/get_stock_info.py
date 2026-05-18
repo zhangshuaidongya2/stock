@@ -4,7 +4,8 @@
 Examples:
   python flow/get_stock_info.py --code 603233 --days 3
   python flow/get_stock_info.py --code 大参林 --days 5
-  python flow/get_stock_info.py --code 603233 --days 3 --output data/dcl.json
+  python flow/get_stock_info.py --code 603233
+  python flow/get_stock_info.py --code 603233 --output data/dcl.json
 """
 
 from __future__ import annotations
@@ -42,8 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--days",
         type=int,
-        default=3,
-        help="读取最近多少个交易日文件，默认 3。",
+        help="读取最近多少个交易日文件；不传则使用当前可用的最大天数。",
     )
     parser.add_argument(
         "--input-dir",
@@ -206,18 +206,19 @@ def write_output(result: dict[str, Any], output_path: Path | None) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.days <= 0:
+    if args.days is not None and args.days <= 0:
         raise SystemExit("--days 必须大于 0")
 
     input_dir = resolve_project_path(args.input_dir)
     all_dates, all_df = read_all_snapshots(input_dir)
-    if args.days > len(all_dates):
+    effective_days = len(all_dates) if args.days is None else args.days
+    if effective_days > len(all_dates):
         raise SystemExit(
-            f"--days={args.days} 超过可用交易日文件数 {len(all_dates)}。"
+            f"--days={effective_days} 超过可用交易日文件数 {len(all_dates)}。"
             f"当前可用日期：{'、'.join(all_dates)}"
         )
 
-    selected_dates = all_dates[-args.days :]
+    selected_dates = all_dates[-effective_days:]
     stock_code, stock_name = resolve_stock_identity(all_df, args.code)
     stock_df = all_df[
         (all_df["代码"].map(normalize_code) == stock_code)
@@ -225,10 +226,10 @@ def main() -> None:
     ].copy()
     if stock_df.empty:
         raise SystemExit(
-            f"最近 {args.days} 个交易日文件中未找到股票 {stock_name or stock_code} 的记录。"
+            f"最近 {effective_days} 个交易日文件中未找到股票 {stock_name or stock_code} 的记录。"
         )
 
-    result = build_result(stock_code, stock_name, stock_df, selected_dates, args.days)
+    result = build_result(stock_code, stock_name, stock_df, selected_dates, effective_days)
     output_path = resolve_project_path(args.output) if args.output else None
     write_output(result, output_path)
 
