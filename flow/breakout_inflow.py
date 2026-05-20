@@ -34,6 +34,7 @@ DEFAULT_CANDIDATE_TOP = 300
 NUMERIC_COLUMNS = [
     "最新价",
     "涨跌幅%",
+    "换手率%",
     "主力净流入(万)",
     "主力净占比%",
     "超大单净流入(万)",
@@ -58,6 +59,7 @@ OUTPUT_COLUMNS = [
     "量比20日均量",
     "成交额(亿)",
     "涨跌幅%",
+    "换手率%",
     "主力净流入(万)",
     "主力净占比%",
     "超大单净流入(万)",
@@ -468,6 +470,7 @@ def build_record(row: Any, signal: dict[str, Any]) -> dict[str, Any]:
         "代码": row.get("代码"),
         "名称": row.get("名称"),
         "最新价": round_or_none(row.get("最新价")),
+        "换手率%": round_or_none(row.get("换手率%")),
         "主力净流入(万)": round_or_none(row.get("主力净流入(万)")),
         "主力净占比%": round_or_none(row.get("主力净占比%")),
         "超大单净流入(万)": round_or_none(row.get("超大单净流入(万)")),

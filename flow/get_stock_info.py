@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from analyze_flow_price import DEFAULT_TURNOVER_PATH, date_columns, read_matrix
 from symbol_search import build_suggestion_message, search_symbol_records, symbol_records_from_rows
 
 from build_today_flow_matrix import (
@@ -32,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "读取 data/today/ 下最近 days 个交易日文件，"
-            "输出指定股票的区间净流入和价格 JSON。"
+            "输出指定股票的区间净流入、价格和换手率 JSON。"
         )
     )
     parser.add_argument(
@@ -49,6 +50,11 @@ def parse_args() -> argparse.Namespace:
         "--input-dir",
         default=str(TODAY_DATA_DIR),
         help=f"输入目录，默认 {display_path(TODAY_DATA_DIR)}。",
+    )
+    parser.add_argument(
+        "--turnover-input",
+        default=str(DEFAULT_TURNOVER_PATH),
+        help=f"换手率矩阵 CSV，默认 {display_path(DEFAULT_TURNOVER_PATH)}。",
     )
     parser.add_argument("--output", help="输出 JSON 文件；不传则打印到终端。")
     return parser.parse_args()
@@ -88,6 +94,22 @@ def read_all_snapshots(input_dir: Path) -> tuple[list[str], pd.DataFrame]:
     all_df = pd.concat(valid_snapshots, ignore_index=True)
     all_df["名称"] = all_df["名称"].fillna("").astype(str).str.strip()
     return [file_path.stem for file_path in files], all_df
+
+
+def build_turnover_map(
+    turnover_df: pd.DataFrame,
+    stock_code: str,
+    selected_dates: list[str],
+) -> dict[str, float | None]:
+    matched = turnover_df[turnover_df["代码"].map(normalize_code) == stock_code].copy()
+    if matched.empty:
+        return {date_tag: None for date_tag in selected_dates}
+
+    row = matched.sort_values("代码", kind="stable").iloc[-1]
+    return {
+        date_tag: round_or_none(row.get(date_tag)) if date_tag in turnover_df.columns else None
+        for date_tag in selected_dates
+    }
 
 
 def resolve_stock_identity(all_df: pd.DataFrame, token: str) -> tuple[str, str]:
@@ -149,6 +171,7 @@ def build_result(
     stock_code: str,
     stock_name: str,
     stock_df: pd.DataFrame,
+    turnover_map: dict[str, float | None],
     selected_dates: list[str],
     days: int,
 ) -> dict[str, Any]:
@@ -190,6 +213,7 @@ def build_result(
         f"{days_label}净流入为正天数": positive_days,
         f"{days_label}每日净流入(万)": flow_map,
         f"{days_label}每日价格": price_map,
+        f"{days_label}每日换手率%": turnover_map,
     }
 
 
@@ -210,6 +234,7 @@ def main() -> None:
         raise SystemExit("--days 必须大于 0")
 
     input_dir = resolve_project_path(args.input_dir)
+    turnover_input_path = resolve_project_path(args.turnover_input)
     all_dates, all_df = read_all_snapshots(input_dir)
     effective_days = len(all_dates) if args.days is None else args.days
     if effective_days > len(all_dates):
@@ -219,6 +244,7 @@ def main() -> None:
         )
 
     selected_dates = all_dates[-effective_days:]
+    turnover_df = read_matrix(turnover_input_path)
     stock_code, stock_name = resolve_stock_identity(all_df, args.code)
     stock_df = all_df[
         (all_df["代码"].map(normalize_code) == stock_code)
@@ -229,7 +255,15 @@ def main() -> None:
             f"最近 {effective_days} 个交易日文件中未找到股票 {stock_name or stock_code} 的记录。"
         )
 
-    result = build_result(stock_code, stock_name, stock_df, selected_dates, effective_days)
+    turnover_map = build_turnover_map(turnover_df, stock_code, selected_dates)
+    result = build_result(
+        stock_code,
+        stock_name,
+        stock_df,
+        turnover_map,
+        selected_dates,
+        effective_days,
+    )
     output_path = resolve_project_path(args.output) if args.output else None
     write_output(result, output_path)
 

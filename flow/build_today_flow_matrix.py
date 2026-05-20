@@ -4,7 +4,7 @@
 Examples:
   python flow/build_today_flow_matrix.py
   python flow/build_today_flow_matrix.py --input-dir data/today
-  python flow/build_today_flow_matrix.py --flow-output data/flow.csv --price-output data/price.csv
+  python flow/build_today_flow_matrix.py --flow-output data/flow.csv --price-output data/price.csv --turnover-output data/turnover.csv
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ DATA_DIR = PROJECT_DIR / "data"
 TODAY_DATA_DIR = DATA_DIR / "today"
 DEFAULT_FLOW_OUTPUT_PATH = DATA_DIR / "flow.csv"
 DEFAULT_PRICE_OUTPUT_PATH = DATA_DIR / "price.csv"
+DEFAULT_TURNOVER_OUTPUT_PATH = DATA_DIR / "turnover.csv"
 DATE_TAG_PATTERN = re.compile(r"^\d{4}$")
 REQUIRED_COLUMNS = ["代码", "名称", "主力净流入(万)", "最新价"]
 
@@ -43,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "整理 data/today/ 下按 MMDD 命名的每日主力资金 CSV，"
-            "输出按股票为行、按日期为列的净流入矩阵和价格矩阵。"
+            "输出按股票为行、按日期为列的净流入矩阵、价格矩阵和换手率矩阵。"
         )
     )
     parser.add_argument(
@@ -62,6 +63,11 @@ def parse_args() -> argparse.Namespace:
         "--price-output",
         default=str(DEFAULT_PRICE_OUTPUT_PATH),
         help=f"价格矩阵输出文件，默认 {display_path(DEFAULT_PRICE_OUTPUT_PATH)}。",
+    )
+    parser.add_argument(
+        "--turnover-output",
+        default=str(DEFAULT_TURNOVER_OUTPUT_PATH),
+        help=f"换手率矩阵输出文件，默认 {display_path(DEFAULT_TURNOVER_OUTPUT_PATH)}。",
     )
     return parser.parse_args()
 
@@ -103,13 +109,26 @@ def read_daily_snapshot(file_path: Path) -> pd.DataFrame:
 
     require_columns(df, file_path)
     if df.empty:
-        return pd.DataFrame(columns=["代码", "名称", "日期", "主力净流入(万)", "最新价"])
+        return pd.DataFrame(
+            {
+                "代码": pd.Series(dtype="string"),
+                "名称": pd.Series(dtype="string"),
+                "日期": pd.Series(dtype="string"),
+                "主力净流入(万)": pd.Series(dtype="float64"),
+                "最新价": pd.Series(dtype="float64"),
+                "换手率%": pd.Series(dtype="float64"),
+            }
+        )
 
     result = df.copy()
     result["代码"] = result["代码"].map(normalize_code)
     result["名称"] = result["名称"].fillna("").astype(str).str.strip()
     result["主力净流入(万)"] = pd.to_numeric(result["主力净流入(万)"], errors="coerce")
     result["最新价"] = pd.to_numeric(result["最新价"], errors="coerce")
+    if "换手率%" in result.columns:
+        result["换手率%"] = pd.to_numeric(result["换手率%"], errors="coerce")
+    else:
+        result["换手率%"] = pd.Series(index=result.index, dtype="float64")
     result = result[result["代码"] != ""].copy()
 
     if "抓取时间" in result.columns:
@@ -117,7 +136,7 @@ def read_daily_snapshot(file_path: Path) -> pd.DataFrame:
 
     result = result.drop_duplicates(subset=["代码"], keep="last")
     result["日期"] = file_path.stem
-    return result[["代码", "名称", "日期", "主力净流入(万)", "最新价"]]
+    return result[["代码", "名称", "日期", "主力净流入(万)", "最新价", "换手率%"]]
 
 
 def read_all_snapshots(files: list[Path]) -> pd.DataFrame:
@@ -128,7 +147,12 @@ def read_all_snapshots(files: list[Path]) -> pd.DataFrame:
     return pd.concat(valid_snapshots, ignore_index=True)
 
 
-def build_matrix(merged_df: pd.DataFrame, value_column: str) -> pd.DataFrame:
+def build_matrix(
+    merged_df: pd.DataFrame,
+    value_column: str,
+    *,
+    drop_all_na_dates: bool = False,
+) -> pd.DataFrame:
     if value_column not in merged_df.columns:
         raise SystemExit(f"汇总数据缺少字段：{value_column}")
 
@@ -143,6 +167,8 @@ def build_matrix(merged_df: pd.DataFrame, value_column: str) -> pd.DataFrame:
         columns="日期",
         values=value_column,
     )
+    if drop_all_na_dates:
+        pivot_df = pivot_df.dropna(axis=1, how="all")
     date_columns = sorted(str(column) for column in pivot_df.columns)
     pivot_df = pivot_df.reindex(columns=date_columns)
 
@@ -162,17 +188,20 @@ def main() -> None:
     input_dir = resolve_project_path(args.input_dir)
     flow_output_path = resolve_project_path(args.flow_output)
     price_output_path = resolve_project_path(args.price_output)
+    turnover_output_path = resolve_project_path(args.turnover_output)
 
     files = list_daily_files(input_dir)
     merged_df = read_all_snapshots(files)
     flow_df = build_matrix(merged_df, "主力净流入(万)")
     price_df = build_matrix(merged_df, "最新价")
+    turnover_df = build_matrix(merged_df, "换手率%", drop_all_na_dates=True)
     write_output(flow_df, flow_output_path)
     write_output(price_df, price_output_path)
+    write_output(turnover_df, turnover_output_path)
 
     date_columns = [column for column in flow_df.columns if DATE_TAG_PATTERN.fullmatch(str(column))]
     print(
-        f"已生成 {display_path(flow_output_path)} 和 {display_path(price_output_path)}；"
+        f"已生成 {display_path(flow_output_path)}、{display_path(price_output_path)} 和 {display_path(turnover_output_path)}；"
         f"处理 {len(files)} 个日文件，"
         f"汇总 {len(flow_df)} 只股票，"
         f"日期列 {len(date_columns)} 个。"

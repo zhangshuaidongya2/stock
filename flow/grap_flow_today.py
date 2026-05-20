@@ -42,6 +42,7 @@ OUTPUT_COLUMNS = [
     "名称",
     "最新价",
     "涨跌幅%",
+    "换手率%",
     "主力流向",
     "主力净流入(万)",
     "主力净占比%",
@@ -56,6 +57,8 @@ OUTPUT_COLUMNS = [
     "资金流时间",
     "抓取时间",
 ]
+
+REQUIRED_OUTPUT_COLUMNS = ["代码", "名称"]
 
 
 def default_date_tag() -> str:
@@ -265,55 +268,66 @@ def resolve_symbols(code_arg: str | None) -> list[dict[str, str]]:
     return resolved
 
 
-def read_exported_codes(output_path: Path) -> set[str]:
+def normalize_existing_output_df(df: Any, output_path: Path) -> Any:
+    unknown_columns = [column for column in df.columns if column not in OUTPUT_COLUMNS]
+    if unknown_columns:
+        raise SystemExit(
+            f"已有导出文件 {output_path} 包含未知字段 {', '.join(unknown_columns)}，"
+            "为避免写错列，已停止。请先备份或处理旧文件。"
+        )
+
+    missing_required = [column for column in REQUIRED_OUTPUT_COLUMNS if column not in df.columns]
+    if missing_required:
+        raise SystemExit(
+            f"已有导出文件 {output_path} 缺少关键字段 {', '.join(missing_required)}，"
+            "无法继续更新。"
+        )
+
+    result = df.copy()
+    for column in OUTPUT_COLUMNS:
+        if column not in result.columns:
+            result[column] = pd.NA
+    return result[OUTPUT_COLUMNS]
+
+
+def load_existing_output_df(output_path: Path) -> Any | None:
     if not output_path.exists() or output_path.stat().st_size == 0:
-        return set()
+        return None
     try:
-        exported_df = pd.read_csv(output_path, dtype={"代码": str})
+        existing_df = pd.read_csv(output_path, dtype={"代码": str})
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(f"无法读取已有导出文件 {output_path}：{exc}") from exc
+    return normalize_existing_output_df(existing_df, output_path)
 
-    current_columns = list(exported_df.columns)
-    if current_columns != OUTPUT_COLUMNS:
-        raise SystemExit(
-            f"已有导出文件 {output_path} 的表头不是当前格式，"
-            "为避免追加错列，已停止。请先备份或处理旧文件。"
-        )
+
+def read_exported_codes(output_path: Path) -> set[str]:
+    existing_df = load_existing_output_df(output_path)
+    if existing_df is None:
+        return set()
     return {
         normalize_code(code)
-        for code in exported_df["代码"].dropna()
+        for code in existing_df["代码"].dropna()
         if normalize_code(code)
     }
 
 
 def append_rows_csv(df: Any, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not output_path.exists() or output_path.stat().st_size == 0
-    if output_path.exists() and output_path.stat().st_size > 0:
-        with output_path.open("rb+") as file_obj:
-            file_obj.seek(-1, 2)
-            if file_obj.read(1) not in {b"\n", b"\r"}:
-                file_obj.write(b"\n")
-    df.to_csv(output_path, mode="a", index=False, header=write_header)
+    existing_df = load_existing_output_df(output_path)
+    if existing_df is None:
+        df.to_csv(output_path, index=False)
+        return
+
+    combined_df = pd.concat([existing_df, df[OUTPUT_COLUMNS]], ignore_index=True)
+    combined_df.to_csv(output_path, index=False)
 
 
 def upsert_rows_csv(df: Any, output_path: Path) -> tuple[int, int]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if not output_path.exists() or output_path.stat().st_size == 0:
+    existing_df = load_existing_output_df(output_path)
+    if existing_df is None:
         df.to_csv(output_path, index=False)
         return 0, len(df)
-
-    try:
-        existing_df = pd.read_csv(output_path, dtype={"代码": str})
-    except Exception as exc:  # noqa: BLE001
-        raise SystemExit(f"无法读取已有导出文件 {output_path}：{exc}") from exc
-
-    current_columns = list(existing_df.columns)
-    if current_columns != OUTPUT_COLUMNS:
-        raise SystemExit(
-            f"已有导出文件 {output_path} 的表头不是当前格式，"
-            "为避免更新错列，已停止。请先备份或处理旧文件。"
-        )
 
     incoming_rows: dict[str, Any] = {}
     for _, row in df.iterrows():
@@ -364,7 +378,7 @@ def fetch_today_fund_flow_batch(
                 params={
                     "secids": secids,
                     "fields": (
-                        "f2,f3,f12,f14,f62,f184,f66,f69,"
+                        "f2,f3,f8,f12,f14,f62,f184,f66,f69,"
                         "f72,f75,f78,f81,f84,f87,f124"
                     ),
                     "ut": "b2884a393a59ad64002292a3e90d46a5",
@@ -412,6 +426,7 @@ def fetch_today_fund_flow_batch(
                 "名称": str(item.get("f14") or code_name_map.get(code, "")),
                 "最新价": round_or_none(item.get("f2")),
                 "涨跌幅%": round_or_none(item.get("f3")),
+                "换手率%": round_or_none(item.get("f8")),
                 "主力流向": build_direction(main_net_wan),
                 "主力净流入(万)": main_net_wan,
                 "主力净占比%": round_or_none(item.get("f184")),

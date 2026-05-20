@@ -22,6 +22,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_DIR / "data"
 DEFAULT_FLOW_PATH = DATA_DIR / "flow.csv"
 DEFAULT_PRICE_PATH = DATA_DIR / "price.csv"
+DEFAULT_TURNOVER_PATH = DATA_DIR / "turnover.csv"
 DATE_TAG_PATTERN = re.compile(r"^\d{4}$")
 DEFAULT_DAYS = 1
 DEFAULT_THRESHOLD_YI = 1.0

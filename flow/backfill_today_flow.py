@@ -46,6 +46,7 @@ OUTPUT_COLUMNS = [
     "名称",
     "最新价",
     "涨跌幅%",
+    "换手率%",
     "主力流向",
     "主力净流入(万)",
     "主力净占比%",
@@ -60,6 +61,8 @@ OUTPUT_COLUMNS = [
     "资金流时间",
     "抓取时间",
 ]
+
+REQUIRED_OUTPUT_COLUMNS = ["代码", "名称"]
 
 HISTORY_COLUMNS = [
     "日期",
@@ -342,55 +345,66 @@ def resolve_symbols(code_arg: str | None) -> list[dict[str, str]]:
     return resolved
 
 
-def read_exported_codes(output_path: Path) -> set[str]:
+def normalize_existing_output_df(df: Any, output_path: Path) -> Any:
+    unknown_columns = [column for column in df.columns if column not in OUTPUT_COLUMNS]
+    if unknown_columns:
+        raise SystemExit(
+            f"已有导出文件 {output_path} 包含未知字段 {', '.join(unknown_columns)}，"
+            "为避免写错列，已停止。请先备份或处理旧文件。"
+        )
+
+    missing_required = [column for column in REQUIRED_OUTPUT_COLUMNS if column not in df.columns]
+    if missing_required:
+        raise SystemExit(
+            f"已有导出文件 {output_path} 缺少关键字段 {', '.join(missing_required)}，"
+            "无法继续更新。"
+        )
+
+    result = df.copy()
+    for column in OUTPUT_COLUMNS:
+        if column not in result.columns:
+            result[column] = pd.NA
+    return result[OUTPUT_COLUMNS]
+
+
+def load_existing_output_df(output_path: Path) -> Any | None:
     if not output_path.exists() or output_path.stat().st_size == 0:
-        return set()
+        return None
     try:
-        exported_df = pd.read_csv(output_path, dtype={"代码": str})
+        existing_df = pd.read_csv(output_path, dtype={"代码": str})
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(f"无法读取已有导出文件 {output_path}：{exc}") from exc
+    return normalize_existing_output_df(existing_df, output_path)
 
-    current_columns = list(exported_df.columns)
-    if current_columns != OUTPUT_COLUMNS:
-        raise SystemExit(
-            f"已有导出文件 {output_path} 的表头不是 today CSV 格式，"
-            "为避免追加错列，已停止。请先备份或处理旧文件。"
-        )
+
+def read_exported_codes(output_path: Path) -> set[str]:
+    existing_df = load_existing_output_df(output_path)
+    if existing_df is None:
+        return set()
     return {
         normalize_code(code)
-        for code in exported_df["代码"].dropna()
+        for code in existing_df["代码"].dropna()
         if normalize_code(code)
     }
 
 
 def append_rows_csv(df: Any, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not output_path.exists() or output_path.stat().st_size == 0
-    if output_path.exists() and output_path.stat().st_size > 0:
-        with output_path.open("rb+") as file_obj:
-            file_obj.seek(-1, 2)
-            if file_obj.read(1) not in {b"\n", b"\r"}:
-                file_obj.write(b"\n")
-    df.to_csv(output_path, mode="a", index=False, header=write_header)
+    existing_df = load_existing_output_df(output_path)
+    if existing_df is None:
+        df.to_csv(output_path, index=False)
+        return
+
+    combined_df = pd.concat([existing_df, df[OUTPUT_COLUMNS]], ignore_index=True)
+    combined_df.to_csv(output_path, index=False)
 
 
 def upsert_rows_csv(df: Any, output_path: Path) -> tuple[int, int]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if not output_path.exists() or output_path.stat().st_size == 0:
+    existing_df = load_existing_output_df(output_path)
+    if existing_df is None:
         df.to_csv(output_path, index=False)
         return 0, len(df)
-
-    try:
-        existing_df = pd.read_csv(output_path, dtype={"代码": str})
-    except Exception as exc:  # noqa: BLE001
-        raise SystemExit(f"无法读取已有导出文件 {output_path}：{exc}") from exc
-
-    current_columns = list(existing_df.columns)
-    if current_columns != OUTPUT_COLUMNS:
-        raise SystemExit(
-            f"已有导出文件 {output_path} 的表头不是 today CSV 格式，"
-            "为避免更新错列，已停止。请先备份或处理旧文件。"
-        )
 
     incoming_rows: dict[str, Any] = {}
     for _, row in df.iterrows():
@@ -471,10 +485,52 @@ def fetch_history_rows(symbol: dict[str, str]) -> dict[str, dict[str, Any]]:
     raise RuntimeError("；".join(errors))
 
 
+def to_sina_symbol(code: str) -> str:
+    normalized = normalize_code(code)
+    if normalized.startswith("6"):
+        return f"sh{normalized}"
+    if normalized.startswith(("4", "8", "9")):
+        return f"bj{normalized}"
+    return f"sz{normalized}"
+
+
+def fetch_turnover_history_rows(symbol: dict[str, str], target_dates: list[date]) -> dict[str, float | None]:
+    try:
+        import akshare as ak  # type: ignore
+    except ImportError:
+        return {}
+
+    try:
+        start_date = min(target_dates).strftime("%Y%m%d")
+        end_date = max(target_dates).strftime("%Y%m%d")
+        history_df = ak.stock_zh_a_daily(
+            symbol=to_sina_symbol(symbol["代码"]),
+            start_date=start_date,
+            end_date=end_date,
+            adjust="qfq",
+        )
+    except Exception:  # noqa: BLE001
+        return {}
+    if history_df is None or history_df.empty:
+        return {}
+
+    result = history_df.copy()
+    result["date"] = pd.to_datetime(result["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    if "turnover" not in result.columns:
+        return {}
+    result["turnover"] = pd.to_numeric(result["turnover"], errors="coerce") * 100
+    result = result.dropna(subset=["date"])
+    return {
+        str(row["date"]): round_or_none(row.get("turnover"))
+        for _, row in result.iterrows()
+    }
+
+
 def build_today_record(
     symbol: dict[str, str],
     target_date: date,
     history_row: dict[str, Any],
+    turnover_pct: float | None,
     fetch_time: str,
 ) -> dict[str, Any]:
     code = normalize_code(symbol["代码"])
@@ -490,6 +546,7 @@ def build_today_record(
         "名称": symbol.get("名称", ""),
         "最新价": round_or_none(history_row.get("收盘价")),
         "涨跌幅%": round_or_none(history_row.get("涨跌幅")),
+        "换手率%": round_or_none(turnover_pct),
         "主力流向": build_direction(main_net_wan),
         "主力净流入(万)": main_net_wan,
         "主力净占比%": round_or_none(history_row.get("主力净流入-净占比")),
@@ -591,6 +648,7 @@ def main() -> None:
         fetched_count += 1
 
         fetch_time = datetime.now(CHINA_TZ).isoformat(timespec="seconds")
+        turnover_by_date = fetch_turnover_history_rows(symbol, needed_dates)
         records_by_date: dict[date, list[dict[str, Any]]] = {
             target_date: []
             for target_date in needed_dates
@@ -601,7 +659,13 @@ def main() -> None:
                 missing_by_date[target_date] += 1
                 continue
             records_by_date[target_date].append(
-                build_today_record(symbol, target_date, history_row, fetch_time)
+                build_today_record(
+                    symbol,
+                    target_date,
+                    history_row,
+                    turnover_by_date.get(target_keys[target_date]),
+                    fetch_time,
+                )
             )
 
         written_parts = []

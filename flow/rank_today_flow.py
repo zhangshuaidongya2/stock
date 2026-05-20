@@ -32,6 +32,7 @@ OUTPUT_COLUMNS = [
     "名称",
     "最新价",
     "涨跌幅%",
+    "换手率%",
     "主力流向",
     "主力净流入(万)",
     "主力净占比%",
@@ -53,6 +54,7 @@ RANK_FIELD_MAP = {
     "large": "大单净流入(万)",
     "main_ratio": "主力净占比%",
     "change": "涨跌幅%",
+    "turnover": "换手率%",
 }
 
 
@@ -101,7 +103,7 @@ def parse_args() -> argparse.Namespace:
         "--rank-by",
         choices=sorted(RANK_FIELD_MAP),
         default="main",
-        help="排序字段：main=主力净流入，super=超大单净流入，large=大单净流入，main_ratio=主力净占比，change=涨跌幅。",
+        help="排序字段：main=主力净流入，super=超大单净流入，large=大单净流入，main_ratio=主力净占比，change=涨跌幅，turnover=换手率。",
     )
     parser.add_argument(
         "--positive-only",
@@ -153,6 +155,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     numeric_columns = [
         "最新价",
         "涨跌幅%",
+        "换手率%",
         "主力净流入(万)",
         "主力净占比%",
         "超大单净流入(万)",
