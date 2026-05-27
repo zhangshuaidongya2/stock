@@ -4,6 +4,7 @@
 Examples:
   python flow/rank_today_flow.py
   python flow/rank_today_flow.py --top 20
+  python flow/rank_today_flow.py --bottom 20
   python flow/rank_today_flow.py --date 0423
   python flow/rank_today_flow.py --rank-by super --top 30 --format json
   python flow/rank_today_flow.py --positive-only
@@ -93,11 +94,17 @@ def parse_args() -> argparse.Namespace:
         default=default_date_tag(),
         help="文件日期标识，格式 MMDD，例如 0423；默认今天。",
     )
-    parser.add_argument(
+    count_group = parser.add_mutually_exclusive_group()
+    count_group.add_argument(
         "--top",
         type=int,
         default=DEFAULT_TOP,
         help=f"输出前多少位，默认 {DEFAULT_TOP}。",
+    )
+    count_group.add_argument(
+        "--bottom",
+        type=int,
+        help="输出排序字段倒数多少位，按数值从低到高排列。",
     )
     parser.add_argument(
         "--rank-by",
@@ -196,7 +203,8 @@ def sanitize(value: Any) -> Any:
 def build_rank_df(
     df: pd.DataFrame,
     rank_by_name: str,
-    top: int,
+    limit: int,
+    bottom: bool,
     positive_only: bool,
     max_change_pct: float | None,
 ) -> pd.DataFrame:
@@ -209,7 +217,7 @@ def build_rank_df(
         require_columns(ranked, ["涨跌幅%"])
         ranked = ranked.dropna(subset=["涨跌幅%"]).copy()
         ranked = ranked[ranked["涨跌幅%"] < max_change_pct].copy()
-    ranked = ranked.sort_values(column, ascending=False).head(top)
+    ranked = ranked.sort_values(column, ascending=bottom).head(limit)
     columns = [item for item in OUTPUT_COLUMNS if item in ranked.columns]
     return ranked[columns]
 
@@ -245,16 +253,21 @@ def write_output(df: pd.DataFrame, output_format: str, output_path: Path | None)
 
 def main() -> None:
     args = parse_args()
-    if args.top <= 0:
+    if args.top is not None and args.top <= 0:
         raise SystemExit("--top 必须大于 0")
+    if args.bottom is not None and args.bottom <= 0:
+        raise SystemExit("--bottom 必须大于 0")
 
     date_tag = normalize_date_tag(args.date)
     input_path = resolve_project_path(args.input) if args.input else default_input_path(date_tag)
     source_df = normalize_df(read_today_csv(input_path))
+    bottom = args.bottom is not None
+    limit = args.bottom if bottom else args.top
     rank_df = build_rank_df(
         df=source_df,
         rank_by_name=args.rank_by,
-        top=args.top,
+        limit=limit,
+        bottom=bottom,
         positive_only=args.positive_only,
         max_change_pct=args.max_change,
     )
