@@ -22,29 +22,22 @@ import requests
 
 
 REQUEST_TIMEOUT = 10
-EASTMONEY_HOSTS = [
-    "push2.eastmoney.com",
-    "1.push2.eastmoney.com",
-    "2.push2.eastmoney.com",
-    "5.push2.eastmoney.com",
-]
-EASTMONEY_HEADERS = {
+TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
+TENCENT_HEADERS = {
     "User-Agent": "Mozilla/5.0",
-    "Referer": "https://quote.eastmoney.com/",
 }
 INDEX_CONFIG = {
     "sh": {
-        "secid": "1.000001",
+        "quote_symbol": "sh000001",
         "symbol": "000001",
         "name": "上证指数",
     },
     "sz": {
-        "secid": "0.399001",
+        "quote_symbol": "sz399001",
         "symbol": "399001",
         "name": "深证成指",
     },
 }
-QUOTE_FIELDS = "f57,f58,f43,f44,f45,f46,f47,f48,f60,f169,f170,f171,f86"
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,15 +64,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def request_json(url: str, params: dict[str, Any]) -> Any:
+def request_quote_text(symbol: str) -> str:
     response = requests.get(
-        url=url,
-        params=params,
-        headers=EASTMONEY_HEADERS,
+        url=TENCENT_QUOTE_URL + symbol,
+        headers=TENCENT_HEADERS,
         timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
-    return response.json()
+    return response.content.decode("gbk", errors="ignore")
 
 
 def require_float(value: Any, field_name: str) -> float:
@@ -88,64 +80,71 @@ def require_float(value: Any, field_name: str) -> float:
     return float(value)
 
 
-def scale_field(data: dict[str, Any], key: str, scale: float = 1.0) -> float:
-    return require_float(data.get(key), key) / scale
+def require_field(parts: list[str], index: int, field_name: str) -> str:
+    if index >= len(parts):
+        raise RuntimeError(f"返回字段缺失：{field_name}")
+    value = parts[index]
+    if value in ("", "-"):
+        raise RuntimeError(f"返回字段为空：{field_name}")
+    return value
 
 
-def parse_quote_time(data: dict[str, Any]) -> str | None:
-    raw_value = data.get("f86")
-    if raw_value in (None, "", "-", 0, "0"):
+def parse_quote_time(raw_value: str) -> str | None:
+    if raw_value in ("", "-", "0"):
         return None
-    quote_time = datetime.fromtimestamp(
-        int(float(raw_value)),
-        tz=timezone.utc,
-    ).astimezone(ZoneInfo("Asia/Shanghai"))
+    quote_time = datetime.strptime(raw_value, "%Y%m%d%H%M%S").replace(
+        tzinfo=ZoneInfo("Asia/Shanghai")
+    )
     return quote_time.isoformat()
 
 
-def extract_quote_item(payload: dict[str, Any]) -> dict[str, Any]:
-    data = payload.get("data")
-    if isinstance(data, dict) and data:
-        return data
-    raise RuntimeError("返回数据缺少 data 字段")
+def extract_quote_parts(payload_text: str) -> list[str]:
+    for line in payload_text.splitlines():
+        if '="' not in line:
+            continue
+        payload = line.split('="', 1)[1].rsplit('"', 1)[0]
+        parts = payload.split("~")
+        if len(parts) >= 44:
+            return parts
+    raise RuntimeError("腾讯返回数据格式异常")
 
 
 def fetch_index_quote(index_key: str) -> dict[str, Any]:
     config = INDEX_CONFIG[index_key]
-    errors = []
-    for host in EASTMONEY_HOSTS:
-        url = f"https://{host}/api/qt/stock/get"
-        try:
-            payload = request_json(
-                url=url,
-                params={
-                    "secid": config["secid"],
-                    "fields": QUOTE_FIELDS,
-                    "invt": "2",
-                    "fltt": "1",
-                },
-            )
-            quote = extract_quote_item(payload)
-            return {
-                "index": index_key,
-                "symbol": str(quote.get("f57") or config["symbol"]),
-                "name": str(quote.get("f58") or config["name"]),
-                "price": scale_field(quote, "f43", 100),
-                "change_amount": scale_field(quote, "f169", 100),
-                "change_percent": scale_field(quote, "f170", 100),
-                "open": scale_field(quote, "f46", 100),
-                "high": scale_field(quote, "f44", 100),
-                "low": scale_field(quote, "f45", 100),
-                "previous_close": scale_field(quote, "f60", 100),
-                "amplitude_percent": scale_field(quote, "f171", 100),
-                "volume": scale_field(quote, "f47"),
-                "amount": scale_field(quote, "f48"),
-                "quote_time": parse_quote_time(quote),
-                "source": "eastmoney",
-            }
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{host}: {type(exc).__name__}: {exc}")
-    raise RuntimeError(f"获取{config['name']}行情失败。错误：{'；'.join(errors)}")
+    try:
+        parts = extract_quote_parts(request_quote_text(config["quote_symbol"]))
+        return {
+            "index": index_key,
+            "symbol": require_field(parts, 2, "symbol"),
+            "name": require_field(parts, 1, "name"),
+            "price": require_float(require_field(parts, 3, "price"), "price"),
+            "change_amount": require_float(
+                require_field(parts, 31, "change_amount"),
+                "change_amount",
+            ),
+            "change_percent": require_float(
+                require_field(parts, 32, "change_percent"),
+                "change_percent",
+            ),
+            "open": require_float(require_field(parts, 5, "open"), "open"),
+            "high": require_float(require_field(parts, 33, "high"), "high"),
+            "low": require_float(require_field(parts, 34, "low"), "low"),
+            "previous_close": require_float(
+                require_field(parts, 4, "previous_close"),
+                "previous_close",
+            ),
+            "amplitude_percent": require_float(
+                require_field(parts, 43, "amplitude_percent"),
+                "amplitude_percent",
+            ),
+            "volume": require_float(require_field(parts, 36, "volume"), "volume"),
+            "amount": require_float(require_field(parts, 37, "amount"), "amount")
+            * 10_000,
+            "quote_time": parse_quote_time(require_field(parts, 30, "quote_time")),
+            "source": "tencent",
+        }
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"获取{config['name']}行情失败：{type(exc).__name__}: {exc}") from exc
 
 
 def fetch_quotes(index_option: str) -> list[dict[str, Any]]:
