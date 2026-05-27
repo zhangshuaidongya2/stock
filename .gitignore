@@ -1,5 +1,3 @@
 .venv/
 __pycache__/
 *.pyc
-stock_symbols_cache.json
-*.csv
