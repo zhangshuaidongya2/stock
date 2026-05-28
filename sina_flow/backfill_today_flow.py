@@ -16,6 +16,7 @@ import json
 import re
 import sys
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time as datetime_time
 from pathlib import Path
@@ -52,6 +53,14 @@ DEFAULT_PAUSE_EVERY = 0
 DEFAULT_PAUSE_SECONDS = 120
 DEFAULT_WORKERS = 8
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    ),
+    "Referer": "https://money.finance.sina.com.cn/moneyflow/",
+}
+_REQUEST_STATE = threading.local()
 
 OUTPUT_COLUMNS = [
     "代码",
@@ -461,17 +470,29 @@ def parse_sina_jsonp_payload(text: str) -> list[dict[str, Any]]:
     return [item for item in payload if isinstance(item, dict)]
 
 
+def get_requests_session() -> Any:
+    session = getattr(_REQUEST_STATE, "session", None)
+    if session is not None:
+        return session
+
+    import requests
+
+    session = requests.Session()
+    session.headers.update(REQUEST_HEADERS)
+    _REQUEST_STATE.session = session
+    return session
+
+
 def fetch_history_rows(
     symbol: dict[str, str],
     *,
     page_size: int = SINA_HISTORY_PAGE_SIZE,
 ) -> dict[str, dict[str, Any]]:
-    import requests
-
+    session = get_requests_session()
     errors = []
     for retry in range(FETCH_RETRY_TIMES + 1):
         try:
-            response = requests.get(
+            response = session.get(
                 SINA_FUND_FLOW_DISTRIBUTION_URL,
                 params={
                     "daima": to_sina_symbol(symbol["代码"]),
@@ -479,13 +500,6 @@ def fetch_history_rows(
                     "num": page_size,
                     "sort": "opendate",
                     "asc": 0,
-                },
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-                    ),
-                    "Referer": "https://money.finance.sina.com.cn/moneyflow/",
                 },
                 timeout=REQUEST_TIMEOUT,
             )
