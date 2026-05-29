@@ -14,6 +14,7 @@ import argparse
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -33,9 +34,10 @@ EASTMONEY_FUND_FLOW_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_DIR / "data"
 TODAY_DATA_DIR = DATA_DIR / "today"
-SYMBOL_CACHE_PATH = PROJECT_DIR / "stock_symbols_cache.json"
+SYMBOL_CACHE_PATH = PROJECT_DIR / "stock_symbols_full_cache.json"
 DEFAULT_BATCH_SIZE = 80
 DEFAULT_DELAY = 0.2
+DEFAULT_WORKERS = 8
 
 OUTPUT_COLUMNS = [
     "代码",
@@ -89,7 +91,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--code",
-        help="股票代码或名称，多个用逗号分隔；不传则读取 stock_symbols_cache.json 全部股票。",
+        help=(
+            "股票代码或名称，多个用逗号分隔；"
+            f"不传则读取 {SYMBOL_CACHE_PATH.name} 全部股票。"
+        ),
     )
     parser.add_argument(
         "--date",
@@ -115,7 +120,13 @@ def parse_args() -> argparse.Namespace:
         "--delay",
         type=float,
         default=DEFAULT_DELAY,
-        help=f"批次之间等待秒数，默认 {DEFAULT_DELAY}。",
+        help=f"单线程模式下批次之间等待秒数，默认 {DEFAULT_DELAY}。",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"并发抓取线程数，默认 {DEFAULT_WORKERS}。",
     )
     return parser.parse_args()
 
@@ -218,7 +229,7 @@ def read_symbol_cache() -> dict[str, str]:
 def resolve_all_symbols() -> list[dict[str, str]]:
     name_map = read_symbol_cache()
     if not name_map:
-        raise SystemExit("stock_symbols_cache.json 为空或无法解析")
+        raise SystemExit(f"{SYMBOL_CACHE_PATH.name} 为空或无法解析")
     symbols = [
         {"代码": code, "名称": name}
         for name, code in name_map.items()
@@ -445,12 +456,37 @@ def fetch_today_fund_flow_batch(
     return records
 
 
+def flatten_batch_records(
+    batch_records: dict[int, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    records = []
+    for batch_index in sorted(batch_records):
+        records.extend(batch_records[batch_index])
+    return records
+
+
+def persist_records(
+    records: list[dict[str, Any]],
+    output_path: Path,
+    update_selected_codes: bool,
+) -> tuple[int, int]:
+    if not records:
+        return 0, 0
+    output_df = pd.DataFrame(records, columns=OUTPUT_COLUMNS)
+    if update_selected_codes:
+        return upsert_rows_csv(output_df, output_path)
+    append_rows_csv(output_df, output_path)
+    return 0, len(output_df)
+
+
 def main() -> None:
     args = parse_args()
     if args.batch_size <= 0:
         raise SystemExit("--batch-size 必须大于 0")
     if args.delay < 0:
         raise SystemExit("--delay 不能小于 0")
+    if args.workers <= 0:
+        raise SystemExit("--workers 必须大于 0")
 
     require_dependencies()
 
@@ -482,59 +518,155 @@ def main() -> None:
         print(
             f"开始更新指定股票当天实时主力资金流：文件日期 {date_tag}，"
             f"股票 {total} 只，已有 {existing_selected} 只会覆盖，"
-            f"待抓取 {len(pending_symbols)} 只，输出文件 {display_path(output_path)}",
+            f"待抓取 {len(pending_symbols)} 只，输出文件 {display_path(output_path)}，"
+            f"并发 {args.workers} 线程",
             file=sys.stderr,
         )
     else:
         print(
             f"开始导出当天实时主力资金流：文件日期 {date_tag}，"
             f"股票 {total} 只，已存在 {skipped} 只，待抓取 {len(pending_symbols)} 只，"
-            f"输出文件 {display_path(output_path)}",
+            f"输出文件 {display_path(output_path)}，并发 {args.workers} 线程",
+            file=sys.stderr,
+        )
+    if args.workers > 1 and args.delay > 0:
+        print(
+            "提示：启用多线程后，--delay 仅在 --workers=1 时生效。",
             file=sys.stderr,
         )
 
     success_count = 0
     replaced_count = 0
     batches = chunks(pending_symbols, args.batch_size)
-    for index, batch in enumerate(batches, start=1):
-        first = batch[0]
-        last = batch[-1]
-        print(
-            f"[{index}/{len(batches)}] 抓取 {len(batch)} 只："
-            f"{first['代码']} {first.get('名称', '')} -> "
-            f"{last['代码']} {last.get('名称', '')}",
-            file=sys.stderr,
-        )
-        try:
-            records = fetch_today_fund_flow_batch(batch)
-        except Exception as exc:  # noqa: BLE001
-            retry_hint = (
-                "修复或稍后重试后，会重新抓取并更新本次指定股票。"
-                if update_selected_codes
-                else "已写入的数据会保留，稍后重试会跳过当天已写入股票。"
+    batch_records: dict[int, list[dict[str, Any]]] = {}
+    total_batches = len(batches)
+    if total_batches == 0:
+        print("无需抓取；目标股票已全部存在。", file=sys.stderr)
+    elif args.workers == 1 or total_batches == 1:
+        for index, batch in enumerate(batches, start=1):
+            first = batch[0]
+            last = batch[-1]
+            print(
+                f"[{index}/{total_batches}] 抓取 {len(batch)} 只："
+                f"{first['代码']} {first.get('名称', '')} -> "
+                f"{last['代码']} {last.get('名称', '')}",
+                file=sys.stderr,
             )
-            raise SystemExit(
-                f"[{index}/{len(batches)}] 获取失败：{type(exc).__name__}: {exc}\n"
-                f"已停止导出；{retry_hint}"
-            ) from exc
+            try:
+                records = fetch_today_fund_flow_batch(batch)
+            except Exception as exc:  # noqa: BLE001
+                partial_records = flatten_batch_records(batch_records)
+                if partial_records:
+                    partial_replaced_count, partial_written_count = persist_records(
+                        partial_records,
+                        output_path,
+                        update_selected_codes,
+                    )
+                    if update_selected_codes:
+                        print(
+                            f"失败前已写入 {partial_written_count} 条，覆盖旧行 "
+                            f"{partial_replaced_count} 条到 {display_path(output_path)}。",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"失败前已写入 {partial_written_count} 条到 "
+                            f"{display_path(output_path)}。",
+                            file=sys.stderr,
+                        )
+                retry_hint = (
+                    "修复或稍后重试后，会重新抓取并更新本次指定股票。"
+                    if update_selected_codes
+                    else "已写入的数据会保留，稍后重试会跳过当天已写入股票。"
+                )
+                raise SystemExit(
+                    f"[{index}/{total_batches}] 获取失败：{type(exc).__name__}: {exc}\n"
+                    f"已停止导出；{retry_hint}"
+                ) from exc
 
-        if records:
-            output_df = pd.DataFrame(records, columns=OUTPUT_COLUMNS)
-            if update_selected_codes:
-                batch_replaced_count, written_count = upsert_rows_csv(output_df, output_path)
-                replaced_count += batch_replaced_count
-                action = f"已更新 {written_count} 条，覆盖旧行 {batch_replaced_count} 条"
-            else:
-                append_rows_csv(output_df, output_path)
-                action = f"已写入 {len(records)} 条"
+            batch_records[index] = records
             success_count += len(records)
             print(
-                f"[{index}/{len(batches)}] {action}",
+                f"[{index}/{total_batches}] 完成 {len(records)} 条",
                 file=sys.stderr,
             )
 
-        if args.delay > 0 and index < len(batches):
-            time.sleep(args.delay)
+            if args.delay > 0 and index < total_batches:
+                time.sleep(args.delay)
+    else:
+        future_map = {}
+        with ThreadPoolExecutor(max_workers=min(args.workers, total_batches)) as executor:
+            for index, batch in enumerate(batches, start=1):
+                first = batch[0]
+                last = batch[-1]
+                print(
+                    f"[{index}/{total_batches}] 提交 {len(batch)} 只："
+                    f"{first['代码']} {first.get('名称', '')} -> "
+                    f"{last['代码']} {last.get('名称', '')}",
+                    file=sys.stderr,
+                )
+                future = executor.submit(fetch_today_fund_flow_batch, batch)
+                future_map[future] = (index, batch)
+
+            completed = 0
+            for future in as_completed(future_map):
+                index, batch = future_map[future]
+                first = batch[0]
+                last = batch[-1]
+                completed += 1
+                try:
+                    records = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    for pending_future in future_map:
+                        if not pending_future.done():
+                            pending_future.cancel()
+                    partial_records = flatten_batch_records(batch_records)
+                    if partial_records:
+                        partial_replaced_count, partial_written_count = persist_records(
+                            partial_records,
+                            output_path,
+                            update_selected_codes,
+                        )
+                        if update_selected_codes:
+                            print(
+                                f"失败前已写入 {partial_written_count} 条，覆盖旧行 "
+                                f"{partial_replaced_count} 条到 {display_path(output_path)}。",
+                                file=sys.stderr,
+                            )
+                        else:
+                            print(
+                                f"失败前已写入 {partial_written_count} 条到 "
+                                f"{display_path(output_path)}。",
+                                file=sys.stderr,
+                            )
+                    retry_hint = (
+                        "修复或稍后重试后，会重新抓取并更新本次指定股票。"
+                        if update_selected_codes
+                        else "已写入的数据会保留，稍后重试会跳过当天已写入股票。"
+                    )
+                    raise SystemExit(
+                        f"[{completed}/{total_batches}] 获取失败：批次 {index}/{total_batches} "
+                        f"({first['代码']} {first.get('名称', '')} -> "
+                        f"{last['代码']} {last.get('名称', '')})，"
+                        f"{type(exc).__name__}: {exc}\n"
+                        f"已停止导出；{retry_hint}"
+                    ) from exc
+
+                batch_records[index] = records
+                success_count += len(records)
+                print(
+                    f"[{completed}/{total_batches}] 完成批次 {index}/{total_batches}，"
+                    f"写入候选 {len(records)} 条",
+                    file=sys.stderr,
+                )
+
+    all_records = flatten_batch_records(batch_records)
+    if all_records:
+        replaced_count, _ = persist_records(
+            all_records,
+            output_path,
+            update_selected_codes,
+        )
 
     if update_selected_codes:
         print(
