@@ -45,7 +45,7 @@ SINA_SPOT_URL = (
     "json_v2.php/Market_Center.getHQNodeData"
 )
 EASTMONEY_FUND_FLOW_URL = "https://push2.eastmoney.com/api/qt/ulist.np/get"
-SYMBOL_CACHE_PATH = Path(__file__).with_name("stock_symbols_cache.json")
+SYMBOL_CACHE_PATH = Path(__file__).with_name("stock_symbols_full_cache.json")
 
 # 命令行未传参时使用的默认配置。
 DEFAULT_RUN_CONFIG = {
