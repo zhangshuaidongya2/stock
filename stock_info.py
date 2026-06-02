@@ -538,6 +538,21 @@ def symbols_are_codes(symbols: str) -> bool:
     return bool(tokens) and all(any(ch.isdigit() for ch in token) for token in tokens)
 
 
+def resolve_unique_symbol_match(
+    token: str,
+    symbol_records: list[dict[str, str]],
+) -> tuple[str | None, str, list[dict[str, Any]]]:
+    matches = search_symbol_records(symbol_records, token, top=6)
+    if len(matches) != 1:
+        return None, "", matches
+
+    code = normalize_code(matches[0].get("代码", ""))
+    name = str(matches[0].get("名称", "")).strip()
+    if not code:
+        return None, "", matches
+    return code, name, matches
+
+
 def resolve_symbol_tokens(
     symbols: str,
 ) -> tuple[list[str], list[tuple[str, list[dict[str, Any]]]]]:
@@ -554,18 +569,36 @@ def resolve_symbol_tokens(
             if normalized_code in code_name_map:
                 resolved_codes.append(normalized_code)
             else:
-                unresolved_tokens.append(
-                    (token, search_symbol_records(symbol_records, token, top=6))
+                resolved_code, resolved_name, matches = resolve_unique_symbol_match(
+                    token, symbol_records
                 )
+                if resolved_code:
+                    print(
+                        f'提示：未精确命中 "{token}"，已自动使用唯一候选 '
+                        f"{resolved_code} {resolved_name}。",
+                        file=sys.stderr,
+                    )
+                    resolved_codes.append(resolved_code)
+                else:
+                    unresolved_tokens.append((token, matches))
             continue
 
         code = name_map.get(token)
         if code:
             resolved_codes.append(code)
         else:
-            unresolved_tokens.append(
-                (token, search_symbol_records(symbol_records, token, top=6))
+            resolved_code, resolved_name, matches = resolve_unique_symbol_match(
+                token, symbol_records
             )
+            if resolved_code:
+                print(
+                    f'提示：未精确命中 "{token}"，已自动使用唯一候选 '
+                    f"{resolved_code} {resolved_name}。",
+                    file=sys.stderr,
+                )
+                resolved_codes.append(resolved_code)
+            else:
+                unresolved_tokens.append((token, matches))
 
     return resolved_codes, unresolved_tokens
 
@@ -851,6 +884,23 @@ def filter_by_symbols(df: Any, symbols: str) -> Any:
             if token_mask.any():
                 mask |= token_mask
                 matched = True
+            else:
+                resolved_code, resolved_name, matches = resolve_unique_symbol_match(
+                    token, symbol_records
+                )
+                if resolved_code:
+                    token_mask = code_series == resolved_code
+                    if token_mask.any():
+                        print(
+                            f'提示：未精确命中 "{token}"，已自动使用唯一候选 '
+                            f"{resolved_code} {resolved_name}。",
+                            file=sys.stderr,
+                        )
+                        mask |= token_mask
+                        matched = True
+                if not matched:
+                    unresolved_tokens.append((token, matches))
+                continue
         else:
             name_mask = name_series.str.contains(token, case=False, na=False)
             if name_mask.any():
@@ -863,6 +913,23 @@ def filter_by_symbols(df: Any, symbols: str) -> Any:
                 if token_mask.any():
                     mask |= token_mask
                     matched = True
+            else:
+                resolved_code, resolved_name, matches = resolve_unique_symbol_match(
+                    token, symbol_records
+                )
+                if resolved_code:
+                    token_mask = code_series == resolved_code
+                    if token_mask.any():
+                        print(
+                            f'提示：未精确命中 "{token}"，已自动使用唯一候选 '
+                            f"{resolved_code} {resolved_name}。",
+                            file=sys.stderr,
+                        )
+                        mask |= token_mask
+                        matched = True
+                if not matched:
+                    unresolved_tokens.append((token, matches))
+                continue
         if not matched:
             unresolved_tokens.append(
                 (

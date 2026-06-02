@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +113,31 @@ def build_turnover_map(
     }
 
 
+def resolve_unique_symbol_match(
+    all_df: pd.DataFrame,
+    token: str,
+    symbol_records: list[dict[str, str]],
+) -> tuple[str | None, str, list[dict[str, Any]]]:
+    matches = search_symbol_records(symbol_records, token, top=8)
+    if len(matches) != 1:
+        return None, "", matches
+
+    code = normalize_code(matches[0].get("代码", ""))
+    if not code:
+        return None, "", matches
+
+    matched = all_df[all_df["代码"].map(normalize_code) == code].copy()
+    if matched.empty:
+        return None, "", matches
+
+    matched = matched.sort_values("日期", kind="stable")
+    latest = matched.iloc[-1]
+    name = str(latest.get("名称", "")).strip()
+    if not name:
+        name = str(matches[0].get("名称", "")).strip()
+    return code, name, matches
+
+
 def resolve_stock_identity(all_df: pd.DataFrame, token: str) -> tuple[str, str]:
     symbol_records = symbol_records_from_rows(
         all_df[["代码", "名称"]].fillna("").astype(str).to_dict(orient="records")
@@ -120,7 +146,16 @@ def resolve_stock_identity(all_df: pd.DataFrame, token: str) -> tuple[str, str]:
     if normalized_input_code:
         matched = all_df[all_df["代码"].map(normalize_code) == normalized_input_code].copy()
         if matched.empty:
-            suggestions = search_symbol_records(symbol_records, token, top=8)
+            resolved_code, resolved_name, suggestions = resolve_unique_symbol_match(
+                all_df, token, symbol_records
+            )
+            if resolved_code:
+                print(
+                    f'提示：未精确命中 "{token}"，已自动使用唯一候选 '
+                    f"{resolved_code} {resolved_name}。",
+                    file=sys.stderr,
+                )
+                return resolved_code, resolved_name
             raise SystemExit(
                 build_suggestion_message(
                     token,
@@ -136,7 +171,16 @@ def resolve_stock_identity(all_df: pd.DataFrame, token: str) -> tuple[str, str]:
     normalized_input_name = normalize_name(token)
     matched = all_df[all_df["名称"].map(normalize_name) == normalized_input_name].copy()
     if matched.empty:
-        suggestions = search_symbol_records(symbol_records, token, top=8)
+        resolved_code, resolved_name, suggestions = resolve_unique_symbol_match(
+            all_df, token, symbol_records
+        )
+        if resolved_code:
+            print(
+                f'提示：未精确命中 "{token}"，已自动使用唯一候选 '
+                f"{resolved_code} {resolved_name}。",
+                file=sys.stderr,
+            )
+            return resolved_code, resolved_name
         raise SystemExit(
             build_suggestion_message(
                 token,
