@@ -15,6 +15,7 @@ import json
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time as datetime_time
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ SYMBOL_CACHE_PATH = PROJECT_DIR / "stock_symbols_cache.json"
 DEFAULT_DELAY = 0.2
 DEFAULT_PAUSE_EVERY = 0
 DEFAULT_PAUSE_SECONDS = 120
+DEFAULT_WORKERS = 2
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
 OUTPUT_COLUMNS = [
@@ -160,6 +162,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_PAUSE_SECONDS,
         help=f"长暂停秒数，默认 {DEFAULT_PAUSE_SECONDS}。",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"并发抓取线程数，默认 {DEFAULT_WORKERS}。",
     )
     return parser.parse_args()
 
@@ -563,12 +571,25 @@ def build_today_record(
     }
 
 
+def fetch_symbol_history_task(
+    symbol: dict[str, str],
+    _target_dates: list[date],
+) -> tuple[dict[str, str], dict[str, dict[str, Any]], str]:
+    # Keep the worker task to pure HTTP history fetches. AkShare's Sina daily
+    # path touches py_mini_racer and has crashed under concurrent initialization.
+    history_rows = fetch_history_rows(symbol)
+    fetch_time = datetime.now(CHINA_TZ).isoformat(timespec="seconds")
+    return symbol, history_rows, fetch_time
+
+
 def main() -> None:
     args = parse_args()
     if args.delay < 0:
         raise SystemExit("--delay 不能小于 0")
     if args.pause_seconds < 0:
         raise SystemExit("--pause-seconds 不能小于 0")
+    if args.workers <= 0:
+        raise SystemExit("--workers 必须大于 0")
 
     require_dependencies()
 
@@ -605,14 +626,21 @@ def main() -> None:
     if update_selected_codes:
         print(
             f"开始补录指定股票历史资金流：日期 {date_text}，"
-            f"股票 {total} 只，输出文件 {file_text}",
+            f"股票 {total} 只，输出文件 {file_text}，"
+            f"并发 {args.workers} 线程",
             file=sys.stderr,
         )
     else:
         print(
             f"开始补录历史资金流：日期 {date_text}，"
             f"股票 {total} 只，任一目标日期已存在 {skipped} 只，"
-            f"待抓取 {len(pending_symbols)} 只，输出文件 {file_text}",
+            f"待抓取 {len(pending_symbols)} 只，输出文件 {file_text}，"
+            f"并发 {args.workers} 线程",
+            file=sys.stderr,
+        )
+    if args.workers > 1 and (args.delay > 0 or args.pause_every > 0):
+        print(
+            "提示：启用多线程后，--delay / --pause-every / --pause-seconds 不再生效。",
             file=sys.stderr,
         )
 
@@ -621,92 +649,182 @@ def main() -> None:
     missing_by_date = {target_date: 0 for target_date in target_dates}
 
     target_keys = {target_date: history_date_key(target_date) for target_date in target_dates}
-    fetched_count = 0
-    for index, symbol in enumerate(pending_symbols, start=1):
+    pending_work = []
+    for symbol in pending_symbols:
         code = normalize_code(symbol["代码"])
-        name = symbol.get("名称", "")
         needed_dates = [
             target_date
             for target_date in target_dates
             if update_selected_codes or code not in exported_codes_by_date[target_date]
         ]
-        if not needed_dates:
-            continue
+        if needed_dates:
+            pending_work.append((symbol, needed_dates))
 
-        print(
-            f"[{index}/{len(pending_symbols)}] 补录 {code} {name} ...",
-            file=sys.stderr,
-        )
-        try:
-            history_rows = fetch_history_rows(symbol)
-        except Exception as exc:  # noqa: BLE001
-            raise SystemExit(
-                f"[{index}/{len(pending_symbols)}] 获取失败 {code} {name}："
-                f"{type(exc).__name__}: {exc}\n"
-                "已停止补录；已写入的数据会保留，稍后重试会跳过已写入股票。"
-            ) from exc
-        fetched_count += 1
-
-        fetch_time = datetime.now(CHINA_TZ).isoformat(timespec="seconds")
-        turnover_by_date = fetch_turnover_history_rows(symbol, needed_dates)
-        records_by_date: dict[date, list[dict[str, Any]]] = {
-            target_date: []
-            for target_date in needed_dates
-        }
-        for target_date in needed_dates:
-            history_row = history_rows.get(target_keys[target_date])
-            if history_row is None:
-                missing_by_date[target_date] += 1
-                continue
-            records_by_date[target_date].append(
-                build_today_record(
-                    symbol,
-                    target_date,
-                    history_row,
-                    turnover_by_date.get(target_keys[target_date]),
-                    fetch_time,
-                )
-            )
-
-        written_parts = []
-        for target_date, records in records_by_date.items():
-            if not records:
-                continue
-            output_df = pd.DataFrame(records, columns=OUTPUT_COLUMNS)
-            output_path = output_paths[target_date]
-            if update_selected_codes:
-                replaced_count, written_count = upsert_rows_csv(output_df, output_path)
-                replaced_by_date[target_date] += replaced_count
-            else:
-                append_rows_csv(output_df, output_path)
-                written_count = len(records)
-            success_by_date[target_date] += written_count
-            exported_codes_by_date[target_date].add(code)
-            written_parts.append(f"{date_tag(target_date)} 写入 {written_count} 条")
-
-        if written_parts:
-            print(f"[{index}/{len(pending_symbols)}] " + "，".join(written_parts), file=sys.stderr)
-        else:
-            missing_text = ",".join(date_tag(target_date) for target_date in needed_dates)
+    total_work = len(pending_work)
+    if total_work == 0:
+        print("无需抓取；目标股票在目标日期均已存在。", file=sys.stderr)
+    elif args.workers == 1:
+        fetched_count = 0
+        for index, (symbol, needed_dates) in enumerate(pending_work, start=1):
+            code = normalize_code(symbol["代码"])
+            name = symbol.get("名称", "")
             print(
-                f"[{index}/{len(pending_symbols)}] 目标日期无历史记录：{missing_text}",
+                f"[{index}/{total_work}] 补录 {code} {name} ...",
                 file=sys.stderr,
             )
+            try:
+                _, history_rows, fetch_time = fetch_symbol_history_task(
+                    symbol,
+                    needed_dates,
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise SystemExit(
+                    f"[{index}/{total_work}] 获取失败 {code} {name}："
+                    f"{type(exc).__name__}: {exc}\n"
+                    "已停止补录；已写入的数据会保留，稍后重试会跳过已写入股票。"
+                ) from exc
+            fetched_count += 1
+            turnover_by_date = fetch_turnover_history_rows(symbol, needed_dates)
 
-        if index < len(pending_symbols):
-            should_long_pause = (
-                args.pause_every > 0
-                and args.pause_seconds > 0
-                and fetched_count % args.pause_every == 0
-            )
-            if should_long_pause:
+            records_by_date: dict[date, list[dict[str, Any]]] = {
+                target_date: []
+                for target_date in needed_dates
+            }
+            for target_date in needed_dates:
+                history_row = history_rows.get(target_keys[target_date])
+                if history_row is None:
+                    missing_by_date[target_date] += 1
+                    continue
+                records_by_date[target_date].append(
+                    build_today_record(
+                        symbol,
+                        target_date,
+                        history_row,
+                        turnover_by_date.get(target_keys[target_date]),
+                        fetch_time,
+                    )
+                )
+
+            written_parts = []
+            for target_date, records in records_by_date.items():
+                if not records:
+                    continue
+                output_df = pd.DataFrame(records, columns=OUTPUT_COLUMNS)
+                output_path = output_paths[target_date]
+                if update_selected_codes:
+                    replaced_count, written_count = upsert_rows_csv(output_df, output_path)
+                    replaced_by_date[target_date] += replaced_count
+                else:
+                    append_rows_csv(output_df, output_path)
+                    written_count = len(records)
+                success_by_date[target_date] += written_count
+                exported_codes_by_date[target_date].add(code)
+                written_parts.append(f"{date_tag(target_date)} 写入 {written_count} 条")
+
+            if written_parts:
+                print(f"[{index}/{total_work}] " + "，".join(written_parts), file=sys.stderr)
+            else:
+                missing_text = ",".join(date_tag(target_date) for target_date in needed_dates)
                 print(
-                    f"已抓取 {fetched_count} 只股票，暂停 {args.pause_seconds:g} 秒后继续...",
+                    f"[{index}/{total_work}] 目标日期无历史记录：{missing_text}",
                     file=sys.stderr,
                 )
-                time.sleep(args.pause_seconds)
-            elif args.delay > 0:
-                time.sleep(args.delay)
+
+            if index < total_work:
+                should_long_pause = (
+                    args.pause_every > 0
+                    and args.pause_seconds > 0
+                    and fetched_count % args.pause_every == 0
+                )
+                if should_long_pause:
+                    print(
+                        f"已抓取 {fetched_count} 只股票，暂停 {args.pause_seconds:g} 秒后继续...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(args.pause_seconds)
+                elif args.delay > 0:
+                    time.sleep(args.delay)
+    else:
+        future_map = {}
+        with ThreadPoolExecutor(max_workers=min(args.workers, total_work)) as executor:
+            for symbol, needed_dates in pending_work:
+                code = normalize_code(symbol["代码"])
+                name = symbol.get("名称", "")
+                print(f"[排队] 补录 {code} {name} ...", file=sys.stderr)
+                future = executor.submit(
+                    fetch_symbol_history_task,
+                    symbol,
+                    needed_dates,
+                )
+                future_map[future] = (symbol, needed_dates)
+
+            completed_count = 0
+            for future in as_completed(future_map):
+                symbol, needed_dates = future_map[future]
+                code = normalize_code(symbol["代码"])
+                name = symbol.get("名称", "")
+                completed_count += 1
+                try:
+                    _, history_rows, fetch_time = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    for pending_future in future_map:
+                        if not pending_future.done():
+                            pending_future.cancel()
+                    raise SystemExit(
+                        f"[{completed_count}/{total_work}] 获取失败 {code} {name}："
+                        f"{type(exc).__name__}: {exc}\n"
+                        "已停止补录；已写入的数据会保留，稍后重试会跳过已写入股票。"
+                    ) from exc
+                turnover_by_date = fetch_turnover_history_rows(symbol, needed_dates)
+
+                records_by_date: dict[date, list[dict[str, Any]]] = {
+                    target_date: []
+                    for target_date in needed_dates
+                }
+                for target_date in needed_dates:
+                    history_row = history_rows.get(target_keys[target_date])
+                    if history_row is None:
+                        missing_by_date[target_date] += 1
+                        continue
+                    records_by_date[target_date].append(
+                        build_today_record(
+                            symbol,
+                            target_date,
+                            history_row,
+                            turnover_by_date.get(target_keys[target_date]),
+                            fetch_time,
+                        )
+                    )
+
+                written_parts = []
+                for target_date, records in records_by_date.items():
+                    if not records:
+                        continue
+                    output_df = pd.DataFrame(records, columns=OUTPUT_COLUMNS)
+                    output_path = output_paths[target_date]
+                    if update_selected_codes:
+                        replaced_count, written_count = upsert_rows_csv(output_df, output_path)
+                        replaced_by_date[target_date] += replaced_count
+                    else:
+                        append_rows_csv(output_df, output_path)
+                        written_count = len(records)
+                    success_by_date[target_date] += written_count
+                    exported_codes_by_date[target_date].add(code)
+                    written_parts.append(f"{date_tag(target_date)} 写入 {written_count} 条")
+
+                if written_parts:
+                    print(
+                        f"[{completed_count}/{total_work}] {code} {name}："
+                        + "，".join(written_parts),
+                        file=sys.stderr,
+                    )
+                else:
+                    missing_text = ",".join(date_tag(target_date) for target_date in needed_dates)
+                    print(
+                        f"[{completed_count}/{total_work}] {code} {name}："
+                        f"目标日期无历史记录：{missing_text}",
+                        file=sys.stderr,
+                    )
 
     summary_parts = []
     for target_date in target_dates:
