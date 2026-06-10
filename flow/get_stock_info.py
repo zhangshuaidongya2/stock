@@ -86,6 +86,16 @@ def round_or_none(value: object, digits: int = 2) -> float | None:
     return round(converted, digits)
 
 
+def format_amount(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return f"{value:.2f}"
+
+
+def display_amount(value: float | None) -> str:
+    return format_amount(value) or "--"
+
+
 def read_all_snapshots(input_dir: Path) -> tuple[list[str], pd.DataFrame]:
     files = list_daily_files(input_dir)
     snapshots = [read_daily_snapshot(file_path) for file_path in files]
@@ -220,19 +230,50 @@ def build_result(
     days: int,
 ) -> dict[str, Any]:
     day_map = build_daily_lookup(stock_df)
-    flow_map: dict[str, float | None] = {}
+    flow_map: dict[str, str] = {}
     price_map: dict[str, float | None] = {}
     flow_values: list[float] = []
+    flow_value_strings: dict[str, str] = {}
+    price_strings: dict[str, str] = {}
+    turnover_strings: dict[str, str] = {}
+    running_total_map: dict[str, float | None] = {}
     days_label = f"最近{days}天"
+    running_inflow_wan = 0.0
+    has_running_inflow = False
+    positive_days = 0
 
     for date_tag in selected_dates:
         row = day_map.get(date_tag)
         flow_value = round_or_none(None if row is None else row.get("主力净流入(万)"))
         price_value = round_or_none(None if row is None else row.get("最新价"))
-        flow_map[date_tag] = flow_value
+        turnover_value = turnover_map.get(date_tag)
         price_map[date_tag] = price_value
         if flow_value is not None:
             flow_values.append(flow_value)
+            running_inflow_wan = round(running_inflow_wan + flow_value, 2)
+            has_running_inflow = True
+            if flow_value > 0:
+                positive_days += 1
+        flow_value_strings[date_tag] = display_amount(flow_value)
+        price_strings[date_tag] = display_amount(price_value)
+        turnover_strings[date_tag] = display_amount(turnover_value)
+        running_total_map[date_tag] = round(running_inflow_wan, 2) if has_running_inflow else None
+
+    flow_value_width = max((len(value) for value in flow_value_strings.values()), default=0)
+    price_width = max((len(value) for value in price_strings.values()), default=0)
+    current_total_width = max((len(display_amount(value)) for value in running_total_map.values()), default=0)
+    gap_width = 4
+    for date_tag in selected_dates:
+        flow_text = flow_value_strings[date_tag]
+        price_text = price_strings[date_tag]
+        current_total_text = display_amount(running_total_map[date_tag])
+        turnover_text = turnover_strings[date_tag]
+        flow_map[date_tag] = (
+            f"{flow_text:<{flow_value_width + gap_width}}"
+            f"价格: {price_text:<{price_width + gap_width}}"
+            f"当前余额: {current_total_text:<{current_total_width + gap_width}}"
+            f"换手率: {turnover_text}"
+        )
 
     start_price = price_map[selected_dates[0]]
     latest_price = price_map[selected_dates[-1]]
@@ -241,10 +282,6 @@ def build_result(
         price_change_pct = round(latest_price / start_price * 100 - 100, 2)
 
     total_inflow_wan = round(sum(flow_values), 2) if flow_values else None
-    positive_days = sum(
-        1 for date_tag in selected_dates if flow_map.get(date_tag) is not None and flow_map[date_tag] > 0
-    )
-
     return {
         "代码": stock_code,
         "名称": stock_name,
@@ -256,8 +293,6 @@ def build_result(
         f"{days_label}主力净流入合计(亿)": round(total_inflow_wan / 10000, 2) if total_inflow_wan is not None else None,
         f"{days_label}净流入为正天数": positive_days,
         f"{days_label}每日净流入(万)": flow_map,
-        f"{days_label}每日价格": price_map,
-        f"{days_label}每日换手率%": turnover_map,
     }
 
 
