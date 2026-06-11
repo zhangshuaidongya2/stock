@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "读取 data/today/ 下最近 days 个交易日文件，"
-            "输出指定股票的区间净流入、价格和换手率 JSON。"
+            "输出指定股票的区间净流入、价格、换手率和均线 JSON。"
         )
     )
     parser.add_argument(
@@ -221,6 +221,66 @@ def build_daily_lookup(stock_df: pd.DataFrame) -> dict[str, pd.Series]:
     }
 
 
+def build_price_by_date(
+    stock_history_df: pd.DataFrame,
+    all_dates: list[str],
+) -> dict[str, float | None]:
+    date_order = {date_tag: index for index, date_tag in enumerate(all_dates)}
+    history_df = stock_history_df.copy()
+    history_df["日期"] = history_df["日期"].astype(str)
+    history_df = history_df[history_df["日期"].isin(all_dates)].copy()
+    if history_df.empty:
+        return {}
+
+    history_df["_date_order"] = history_df["日期"].map(date_order)
+    history_df = (
+        history_df.sort_values("_date_order", kind="stable")
+        .drop_duplicates(subset=["日期"], keep="last")
+    )
+    return {
+        str(row["日期"]): round_or_none(row.get("最新价"))
+        for _, row in history_df.iterrows()
+    }
+
+
+def build_moving_average_map_for_date(
+    price_by_date: dict[str, float | None],
+    all_dates: list[str],
+    end_date: str,
+    windows: tuple[int, ...] = (5, 10, 20),
+) -> dict[str, float | None]:
+    date_order = {date_tag: index for index, date_tag in enumerate(all_dates)}
+    if end_date not in date_order:
+        return {f"{window}日均线": None for window in windows}
+
+    ordered_dates = all_dates[: date_order[end_date] + 1]
+    result: dict[str, float | None] = {}
+    for window in windows:
+        field_name = f"{window}日均线"
+        if len(ordered_dates) < window:
+            result[field_name] = None
+            continue
+        window_dates = ordered_dates[-window:]
+        window_prices = [price_by_date.get(date_tag) for date_tag in window_dates]
+        if any(price is None for price in window_prices):
+            result[field_name] = None
+            continue
+        result[field_name] = round(sum(window_prices) / window, 2)
+    return result
+
+
+def build_daily_moving_average_map(
+    price_by_date: dict[str, float | None],
+    all_dates: list[str],
+    target_dates: list[str],
+    windows: tuple[int, ...] = (5, 10, 20),
+) -> dict[str, dict[str, float | None]]:
+    return {
+        date_tag: build_moving_average_map_for_date(price_by_date, all_dates, date_tag, windows)
+        for date_tag in target_dates
+    }
+
+
 def build_result(
     stock_code: str,
     stock_name: str,
@@ -228,6 +288,8 @@ def build_result(
     turnover_map: dict[str, float | None],
     selected_dates: list[str],
     days: int,
+    moving_average_map: dict[str, float | None],
+    daily_moving_average_map: dict[str, dict[str, float | None]],
 ) -> dict[str, Any]:
     day_map = build_daily_lookup(stock_df)
     flow_map: dict[str, str] = {}
@@ -236,6 +298,9 @@ def build_result(
     flow_value_strings: dict[str, str] = {}
     price_strings: dict[str, str] = {}
     turnover_strings: dict[str, str] = {}
+    ma5_strings: dict[str, str] = {}
+    ma10_strings: dict[str, str] = {}
+    ma20_strings: dict[str, str] = {}
     running_total_map: dict[str, float | None] = {}
     days_label = f"最近{days}天"
     running_inflow_wan = 0.0
@@ -257,22 +322,36 @@ def build_result(
         flow_value_strings[date_tag] = display_amount(flow_value)
         price_strings[date_tag] = display_amount(price_value)
         turnover_strings[date_tag] = display_amount(turnover_value)
+        moving_average_for_day = daily_moving_average_map.get(date_tag, {})
+        ma5_strings[date_tag] = display_amount(moving_average_for_day.get("5日均线"))
+        ma10_strings[date_tag] = display_amount(moving_average_for_day.get("10日均线"))
+        ma20_strings[date_tag] = display_amount(moving_average_for_day.get("20日均线"))
         running_total_map[date_tag] = round(running_inflow_wan, 2) if has_running_inflow else None
 
     flow_value_width = max((len(value) for value in flow_value_strings.values()), default=0)
     price_width = max((len(value) for value in price_strings.values()), default=0)
+    turnover_width = max((len(value) for value in turnover_strings.values()), default=0)
+    ma5_width = max((len(value) for value in ma5_strings.values()), default=0)
+    ma10_width = max((len(value) for value in ma10_strings.values()), default=0)
+    ma20_width = max((len(value) for value in ma20_strings.values()), default=0)
     current_total_width = max((len(display_amount(value)) for value in running_total_map.values()), default=0)
     gap_width = 4
     for date_tag in selected_dates:
         flow_text = flow_value_strings[date_tag]
         price_text = price_strings[date_tag]
+        ma5_text = ma5_strings[date_tag]
+        ma10_text = ma10_strings[date_tag]
+        ma20_text = ma20_strings[date_tag]
         current_total_text = display_amount(running_total_map[date_tag])
         turnover_text = turnover_strings[date_tag]
         flow_map[date_tag] = (
             f"{flow_text:<{flow_value_width + gap_width}}"
             f"价格: {price_text:<{price_width + gap_width}}"
             f"当前余额: {current_total_text:<{current_total_width + gap_width}}"
-            f"换手率: {turnover_text}"
+            f"换手率: {turnover_text:<{turnover_width + gap_width}}"
+            f"5日线: {ma5_text:<{ma5_width + gap_width}}"
+            f"10日线: {ma10_text:<{ma10_width + gap_width}}"
+            f"20日线: {ma20_text}"
         )
 
     start_price = price_map[selected_dates[0]]
@@ -282,7 +361,7 @@ def build_result(
         price_change_pct = round(latest_price / start_price * 100 - 100, 2)
 
     total_inflow_wan = round(sum(flow_values), 2) if flow_values else None
-    return {
+    result = {
         "代码": stock_code,
         "名称": stock_name,
         "分析区间": f"{selected_dates[0]}-{selected_dates[-1]}",
@@ -294,6 +373,14 @@ def build_result(
         f"{days_label}净流入为正天数": positive_days,
         f"{days_label}每日净流入(万)": flow_map,
     }
+    result.update(
+        {
+            field_name: value
+            for field_name, value in moving_average_map.items()
+            if value is not None
+        }
+    )
+    return result
 
 
 def write_output(result: dict[str, Any], output_path: Path | None) -> None:
@@ -325,6 +412,7 @@ def main() -> None:
     selected_dates = all_dates[-effective_days:]
     turnover_df = read_matrix(turnover_input_path)
     stock_code, stock_name = resolve_stock_identity(all_df, args.code)
+    stock_history_df = all_df[all_df["代码"].map(normalize_code) == stock_code].copy()
     stock_df = all_df[
         (all_df["代码"].map(normalize_code) == stock_code)
         & (all_df["日期"].isin(selected_dates))
@@ -335,6 +423,12 @@ def main() -> None:
         )
 
     turnover_map = build_turnover_map(turnover_df, stock_code, selected_dates)
+    price_by_date = build_price_by_date(
+        stock_history_df,
+        all_dates,
+    )
+    moving_average_map = build_moving_average_map_for_date(price_by_date, all_dates, selected_dates[-1])
+    daily_moving_average_map = build_daily_moving_average_map(price_by_date, all_dates, selected_dates)
     result = build_result(
         stock_code,
         stock_name,
@@ -342,6 +436,8 @@ def main() -> None:
         turnover_map,
         selected_dates,
         effective_days,
+        moving_average_map,
+        daily_moving_average_map,
     )
     output_path = resolve_project_path(args.output) if args.output else None
     write_output(result, output_path)
