@@ -76,7 +76,25 @@ def calculate_moving_average(row: pd.Series, price_tags: list[str], end_index: i
     return round(sum(float(value) for value in values) / window, 2)
 
 
-def build_records(price_df: pd.DataFrame, target_date: str) -> tuple[str, list[dict[str, Any]], dict[str, int]]:
+def build_next_day_change(
+    target_price: float | None,
+    next_price: float | None,
+) -> tuple[str | None, float | None]:
+    if target_price in (None, 0) or next_price is None:
+        return None, None
+
+    change_pct = round(next_price / target_price * 100 - 100, 2)
+    if change_pct > 0:
+        return "增加", change_pct
+    if change_pct < 0:
+        return "减少", change_pct
+    return "不变", change_pct
+
+
+def build_records(
+    price_df: pd.DataFrame,
+    target_date: str,
+) -> tuple[str, str | None, list[dict[str, Any]], dict[str, int], dict[str, int] | None]:
     price_tags = date_columns(price_df)
     if target_date not in price_tags:
         raise SystemExit(
@@ -94,8 +112,20 @@ def build_records(price_df: pd.DataFrame, target_date: str) -> tuple[str, list[d
         )
 
     previous_date = price_tags[target_index - 1]
+    next_date = price_tags[target_index + 1] if target_index + 1 < len(price_tags) else None
     records: list[dict[str, Any]] = []
     eligible_count = 0
+    next_day_summary = (
+        {
+            "可比较个数": 0,
+            "股价增加个数": 0,
+            "股价减少个数": 0,
+            "股价不变个数": 0,
+            "缺少后一日价格个数": 0,
+        }
+        if next_date is not None
+        else None
+    )
 
     for _, row in price_df.iterrows():
         prev_ma_short = calculate_moving_average(row, price_tags, target_index - 1, SHORT_WINDOW)
@@ -112,19 +142,34 @@ def build_records(price_df: pd.DataFrame, target_date: str) -> tuple[str, list[d
 
         prev_diff = round(prev_ma_short - prev_ma_long, 2)
         curr_diff = round(curr_ma_short - curr_ma_long, 2)
+        target_price = round_or_none(row[target_date])
+        next_price = round_or_none(row[next_date]) if next_date is not None else None
+        next_day_flag, next_day_change_pct = build_next_day_change(target_price, next_price)
+
+        if next_day_summary is not None:
+            if next_day_flag is None:
+                next_day_summary["缺少后一日价格个数"] += 1
+            else:
+                next_day_summary["可比较个数"] += 1
+                next_day_summary[f"股价{next_day_flag}个数"] += 1
+
         records.append(
             {
                 "代码": row["代码"],
                 "名称": row["名称"],
                 "前一交易日": previous_date,
                 "目标日期": target_date,
-                "目标日价格": round_or_none(row[target_date]),
+                "目标日价格": target_price,
                 "前一日5日均线": prev_ma_short,
                 "前一日20日均线": prev_ma_long,
                 "当日5日均线": curr_ma_short,
                 "当日20日均线": curr_ma_long,
                 "前一日均线差": prev_diff,
                 "当日均线差": curr_diff,
+                "后一交易日": next_date,
+                "后一日价格": next_price,
+                "后一日涨跌标志": next_day_flag,
+                "后一日涨跌幅%": next_day_change_pct,
             }
         )
 
@@ -141,7 +186,7 @@ def build_records(price_df: pd.DataFrame, target_date: str) -> tuple[str, list[d
         "历史不足或缺价格样本数": int(len(price_df) - eligible_count),
         "黄金交叉数量": int(len(records)),
     }
-    return previous_date, records, stats
+    return previous_date, next_date, records, stats, next_day_summary
 
 
 def build_result(
@@ -149,19 +194,25 @@ def build_result(
     price_input: Path,
     target_date: str,
     previous_date: str,
+    next_date: str | None,
     stats: dict[str, int],
+    next_day_summary: dict[str, int] | None,
     records: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    return {
+    result = {
         "分析参数": {
             "目标日期": target_date,
             "前一交易日": previous_date,
+            "后一交易日": next_date,
             "价格文件": display_path(price_input),
             "黄金交叉定义": "前一交易日5日均线<=20日均线，且目标日期5日均线>20日均线",
         },
         "样本信息": stats,
-        "结果": records,
     }
+    if next_day_summary is not None:
+        result["后一交易日表现汇总"] = next_day_summary
+    result["结果"] = records
+    return result
 
 
 def write_output(result: dict[str, Any], output_path: Path | None) -> None:
@@ -181,12 +232,14 @@ def main() -> None:
     target_date = normalize_date_tag(args.date)
 
     price_df = read_matrix(price_input)
-    previous_date, records, stats = build_records(price_df, target_date)
+    previous_date, next_date, records, stats, next_day_summary = build_records(price_df, target_date)
     result = build_result(
         price_input=price_input,
         target_date=target_date,
         previous_date=previous_date,
+        next_date=next_date,
         stats=stats,
+        next_day_summary=next_day_summary,
         records=records,
     )
     write_output(result, output_path)
