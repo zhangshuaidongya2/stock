@@ -40,13 +40,14 @@ DEFAULT_VOLUME_WINDOW = 20
 DEFAULT_MIN_VOLUME_RATIO = 1.2
 DEFAULT_HISTORY_SOURCE = "sina"
 DEFAULT_ADJUST = "qfq"
+MULTI_PERIOD_WINDOWS = (5, 10, 20)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "输入单只股票代码或名称，输出放量/量价关系 JSON。"
-            "包括量比、成交额量比、收盘位置、上影线、换手率分位和量价结论。"
+            "输入单只股票代码或名称，输出 5/10/20 日多周期量能与量价关系 JSON。"
+            "包括成交量量比、成交额量比、收盘位置、上影线、主力资金和量价结论。"
         )
     )
     parser.add_argument(
@@ -261,90 +262,186 @@ def round_or_none(value: Any, digits: int = 2) -> float | None:
     return stock_info_module.round_or_none(value, digits)
 
 
-def classify_volume_signal(volume_ratio: float | None, min_volume_ratio: float) -> tuple[bool | None, str]:
-    """只判断量能本身：有没有放量。"""
-    if volume_ratio is None:
+def calculate_shifted_average_ratio(
+    series: pd.Series | None,
+    current_value: float | None,
+    window: int,
+) -> tuple[float | None, float | None]:
+    if series is None or series.empty:
+        return None, None
+    average_value = safe_float(series.rolling(window, min_periods=window).mean().shift(1).iloc[-1])
+    if average_value in (None, 0) or current_value is None:
+        return average_value, None
+    return average_value, current_value / average_value
+
+
+def calculate_multi_period_ratios(
+    volume: pd.Series,
+    amount: pd.Series | None,
+) -> dict[int, dict[str, float | None]]:
+    metrics: dict[int, dict[str, float | None]] = {}
+    current_volume = safe_float(volume.iloc[-1]) if not volume.empty else None
+    current_amount = safe_float(amount.iloc[-1]) if amount is not None and not amount.empty else None
+
+    for window in MULTI_PERIOD_WINDOWS:
+        volume_ma, volume_ratio = calculate_shifted_average_ratio(volume, current_volume, window)
+        amount_ma, amount_ratio = calculate_shifted_average_ratio(amount, current_amount, window)
+        metrics[window] = {
+            "volume_ma": volume_ma,
+            "volume_ratio": volume_ratio,
+            "amount_ma": amount_ma,
+            "amount_ratio": amount_ratio,
+        }
+    return metrics
+
+
+def classify_volume_level(main_ratio: float | None) -> tuple[bool | None, str]:
+    if main_ratio is None:
         return None, "历史数据不足，无法判断"
-    if volume_ratio >= max(min_volume_ratio, 1.8):
-        return True, "明显放量"
-    if volume_ratio >= min_volume_ratio:
-        return True, "温和放量"
-    if volume_ratio <= 0.8:
+    if main_ratio < 0.8:
         return False, "缩量"
-    return False, "量能平稳"
+    if main_ratio < 1.2:
+        return False, "正常量"
+    if main_ratio < 1.5:
+        return True, "温和放量"
+    if main_ratio < 2.0:
+        return True, "明显放量"
+    if main_ratio < 2.5:
+        return True, "大幅放量"
+    return True, "极端放量"
+
+
+def classify_close_position(close_position: float | None) -> str | None:
+    if close_position is None:
+        return None
+    if close_position >= 0.7:
+        return "收盘偏强"
+    if close_position <= 0.4:
+        return "收盘偏弱"
+    return "收盘中性"
+
+
+def classify_upper_shadow(upper_shadow_pct: float | None) -> str | None:
+    if upper_shadow_pct is None:
+        return None
+    if upper_shadow_pct >= 5:
+        return "上影线很长，抛压较重"
+    if upper_shadow_pct >= 3:
+        return "上影线明显"
+    return "上影线不明显"
+
+
+def classify_main_flow(main_net_inflow_ratio: float | None) -> str | None:
+    if main_net_inflow_ratio is None:
+        return None
+    if main_net_inflow_ratio < -15:
+        return "流出压力很重"
+    if main_net_inflow_ratio < -8:
+        return "主力明显流出"
+    if main_net_inflow_ratio < -3:
+        return "主力偏流出"
+    if main_net_inflow_ratio <= 3:
+        return "主力资金中性"
+    if main_net_inflow_ratio <= 8:
+        return "主力偏流入"
+    return "主力明显流入"
+
+
+def select_primary_ratio(
+    period_metrics: dict[int, dict[str, float | None]],
+) -> tuple[float | None, str | None]:
+    candidates = [
+        ("10日成交额量比", period_metrics[10]["amount_ratio"]),
+        ("10日成交量量比", period_metrics[10]["volume_ratio"]),
+        ("20日成交额量比", period_metrics[20]["amount_ratio"]),
+        ("20日成交量量比", period_metrics[20]["volume_ratio"]),
+    ]
+    for label, value in candidates:
+        if value is not None:
+            return value, label
+    return None, None
+
+
+def build_multi_period_volume_comment(
+    period_metrics: dict[int, dict[str, float | None]],
+) -> str | None:
+    ratio_5 = period_metrics[5]["amount_ratio"]
+    ratio_10 = period_metrics[10]["amount_ratio"]
+    ratio_20 = period_metrics[20]["amount_ratio"]
+
+    if ratio_5 is None and ratio_10 is None and ratio_20 is None:
+        return None
+    if None not in (ratio_5, ratio_10, ratio_20):
+        assert ratio_5 is not None and ratio_10 is not None and ratio_20 is not None
+        if ratio_5 >= 1.5 and ratio_10 >= 1.5 and ratio_20 >= 1.5:
+            return "多周期同步放量，说明今日成交相对短中期都明显放大，筹码交换剧烈。"
+        if ratio_5 >= 1.5 and ratio_10 < 1.5 and ratio_20 < 1.5:
+            return "短线异动放量，相对最近几天明显活跃，但中期异常程度一般。"
+        if ratio_5 < 1.5 and ratio_20 >= 1.5:
+            return "近期已持续放量，今日相对最近几天不算极端，但相对过去一个月仍处于高成交状态。"
+        if ratio_5 < 0.8 and ratio_10 < 0.8 and ratio_20 < 0.8:
+            return "多周期缩量，资金参与度下降。"
+    return "多周期量能分化，短中期活跃度并不同步，需要结合后续走势确认。"
 
 
 def classify_volume_price_signal(
     *,
-    volume_ratio: float | None,
-    amount_ratio: float | None,
+    amount_ratio_10: float | None,
+    volume_ratio_10: float | None,
+    amount_ratio_20: float | None,
+    volume_ratio_20: float | None,
     day_change_pct: float | None,
     close_position: float | None,
     upper_shadow_pct: float | None,
-    turnover_ratio: float | None,
     main_net_inflow_ratio: float | None,
-    min_volume_ratio: float,
 ) -> tuple[str, str, list[str]]:
-    """综合量、价、K线位置、换手和主力资金，判断放量性质。
-
-    重点不是“有没有放量”，而是“放量之后价格有没有被推上去”。
-    """
     risk_flags: list[str] = []
+    period_metrics = {
+        10: {"amount_ratio": amount_ratio_10, "volume_ratio": volume_ratio_10},
+        20: {"amount_ratio": amount_ratio_20, "volume_ratio": volume_ratio_20},
+    }
+    main_ratio, main_ratio_source = select_primary_ratio(period_metrics)
 
-    if volume_ratio is None or day_change_pct is None:
+    if main_ratio is None or day_change_pct is None:
         return "数据不足", "历史数据不足，无法判断量价关系", risk_flags
 
-    is_heavy_volume = volume_ratio >= max(min_volume_ratio, 1.8)
-    is_mild_volume = volume_ratio >= min_volume_ratio
-    is_low_volume = volume_ratio <= 0.8
-    heavy_amount = amount_ratio is not None and amount_ratio >= max(min_volume_ratio, 1.8)
-    mild_amount = amount_ratio is not None and amount_ratio >= min_volume_ratio
-
-    close_strong = close_position is not None and close_position >= 0.70
-    close_weak = close_position is not None and close_position <= 0.40
-    long_upper_shadow = upper_shadow_pct is not None and upper_shadow_pct >= 3.0
-    high_turnover = turnover_ratio is not None and turnover_ratio >= 1.8
-    main_outflow = main_net_inflow_ratio is not None and main_net_inflow_ratio <= -8.0
-
-    if is_heavy_volume:
-        risk_flags.append("成交量明显高于均值")
-    if heavy_amount:
-        risk_flags.append("成交额明显高于均值")
-    elif mild_amount:
-        risk_flags.append("成交额高于均值")
-    if long_upper_shadow:
+    if main_ratio_source is not None:
+        risk_flags.append(f"主判断量比来自{main_ratio_source}")
+    if main_ratio >= 2.5:
+        risk_flags.append("主量比达到极端放量水平")
+    elif main_ratio >= 1.5:
+        risk_flags.append("主量比处于明显放量区间")
+    if close_position is not None and close_position < 0.4:
+        risk_flags.append("收盘位置偏低，尾盘承接偏弱")
+    if upper_shadow_pct is not None and upper_shadow_pct >= 5:
+        risk_flags.append("上影线很长，抛压较重")
+    elif upper_shadow_pct is not None and upper_shadow_pct >= 3:
         risk_flags.append("出现明显上影线，存在冲高回落")
-    if close_weak:
-        risk_flags.append("收盘位置偏低，承接偏弱")
-    if high_turnover:
-        risk_flags.append("换手率明显高于均值，筹码交换剧烈")
-    if main_outflow:
-        risk_flags.append("主力净流出占成交额比例较高")
+    if main_net_inflow_ratio is not None and main_net_inflow_ratio < -15:
+        risk_flags.append("主力资金流出压力很重")
+    elif main_net_inflow_ratio is not None and main_net_inflow_ratio <= -8:
+        risk_flags.append("主力资金明显流出")
 
-    if is_heavy_volume and day_change_pct >= 5 and close_strong and not main_outflow:
-        return "强势放量上涨", "放量后价格被有效推升，且收盘靠近高点，承接较强", risk_flags
-
-    if is_heavy_volume and day_change_pct < 0:
-        return "放量下跌", "成交明显放大但股价下跌，资金撤退迹象较强", risk_flags
-
-    if is_heavy_volume and 0 <= day_change_pct <= 2 and (close_weak or main_outflow):
-        return "放量滞涨", "成交明显放大，但涨幅有限且承接不强，存在高位派发嫌疑", risk_flags
-
-    if is_heavy_volume and long_upper_shadow and (main_outflow or close_weak):
-        return "疑似高位派发", "放量、上影线、收盘偏弱或主力流出同时出现，需要重点警惕", risk_flags
-
-    if is_mild_volume and day_change_pct >= 3 and close_strong:
-        return "温和放量上涨", "量能放大，价格同步上涨，走势相对健康", risk_flags
-
-    if is_low_volume and day_change_pct < 0:
-        return "缩量回调", "量能萎缩且股价回调，暂未显示恐慌性抛压", risk_flags
-
-    if is_low_volume and day_change_pct > 0:
-        return "缩量上涨", "股价上涨但量能不足，可能是锁筹，也可能是跟风不足", risk_flags
-
-    if is_heavy_volume and day_change_pct > 0 and main_outflow:
-        return "放量分歧上涨", "股价上涨但主力资金流出，说明老资金兑现与新资金承接同时存在", risk_flags
-
+    if (
+        main_ratio >= 1.5
+        and upper_shadow_pct is not None
+        and upper_shadow_pct >= 3
+        and main_net_inflow_ratio is not None
+        and main_net_inflow_ratio <= -8
+    ):
+        return "疑似高位派发", "疑似高位派发：放量、长上影、主力明显流出同时出现，需警惕资金借高人气兑现。", risk_flags
+    if main_ratio >= 1.5 and day_change_pct >= 5 and close_position is not None and close_position >= 0.7:
+        return "强势放量上涨", "强势放量上涨：成交明显放大，股价大涨且收盘靠近高点，承接较强。", risk_flags
+    if main_ratio >= 1.2 and day_change_pct >= 3 and close_position is not None and close_position >= 0.7:
+        return "温和放量上涨", "温和放量上涨：量能放大，价格同步上涨，走势偏健康。", risk_flags
+    if main_ratio >= 1.5 and 0 <= day_change_pct <= 2 and close_position is not None and close_position < 0.6:
+        return "放量滞涨", "放量滞涨：成交明显放大，但股价涨幅有限，说明上方抛压较重。", risk_flags
+    if main_ratio >= 1.5 and day_change_pct < 0:
+        return "放量下跌", "放量下跌：成交明显放大但股价下跌，卖方占优，资金撤退迹象较强。", risk_flags
+    if main_ratio <= 0.8 and day_change_pct < 0:
+        return "缩量回调", "缩量回调：量能萎缩，股价回调，暂未显示恐慌性抛压。", risk_flags
+    if main_ratio <= 0.8 and day_change_pct > 0:
+        return "缩量上涨", "缩量上涨：股价上涨但量能不足，可能是锁筹，也可能是跟风不足。", risk_flags
     return "量价中性", "量价关系暂不极端，需要结合后续走势确认", risk_flags
 
 
@@ -387,26 +484,15 @@ def analyze_volume_signal(
     current_amount = safe_float(amount.iloc[-1]) if amount is not None and not amount.empty else None
     current_turnover = safe_float(turnover.iloc[-1]) if turnover is not None and not turnover.empty else None
 
-    volume_ma = None
-    volume_ratio = None
-    if len(volume) >= volume_window + 1:
-        volume_ma = safe_float(volume.rolling(volume_window).mean().shift(1).iloc[-1])
-        if volume_ma not in (None, 0) and current_volume is not None:
-            volume_ratio = current_volume / volume_ma
+    period_metrics = calculate_multi_period_ratios(volume, amount)
 
-    amount_ma = None
-    amount_ratio = None
-    if amount is not None and len(amount.dropna()) >= volume_window + 1:
-        amount_ma = safe_float(amount.rolling(volume_window).mean().shift(1).iloc[-1])
-        if amount_ma not in (None, 0) and current_amount is not None:
-            amount_ratio = current_amount / amount_ma
+    volume_ma, volume_ratio = calculate_shifted_average_ratio(volume, current_volume, volume_window)
+    amount_ma, amount_ratio = calculate_shifted_average_ratio(amount, current_amount, volume_window)
 
     turnover_ma = None
     turnover_ratio = None
-    if turnover is not None and len(turnover.dropna()) >= volume_window + 1:
-        turnover_ma = safe_float(turnover.rolling(volume_window).mean().shift(1).iloc[-1])
-        if turnover_ma not in (None, 0) and current_turnover is not None:
-            turnover_ratio = current_turnover / turnover_ma
+    if turnover is not None:
+        turnover_ma, turnover_ratio = calculate_shifted_average_ratio(turnover, current_turnover, volume_window)
 
     volume_pct = None
     valid_volume = volume.dropna()
@@ -445,18 +531,35 @@ def analyze_volume_signal(
     if main_net_inflow_yuan is not None and current_amount not in (None, 0):
         main_net_inflow_ratio = main_net_inflow_yuan / current_amount * 100
 
-    is_expanding, signal_label = classify_volume_signal(volume_ratio, min_volume_ratio)
+    main_ratio, main_ratio_source = select_primary_ratio(period_metrics)
+    is_expanding, signal_label = classify_volume_level(main_ratio)
+    close_position_label = classify_close_position(close_position)
+    upper_shadow_label = classify_upper_shadow(upper_shadow_pct)
+    main_flow_label = classify_main_flow(main_net_inflow_ratio)
+    multi_period_comment = build_multi_period_volume_comment(period_metrics)
     volume_price_label, volume_price_desc, risk_flags = classify_volume_price_signal(
-        volume_ratio=volume_ratio,
-        amount_ratio=amount_ratio,
+        amount_ratio_10=period_metrics[10]["amount_ratio"],
+        volume_ratio_10=period_metrics[10]["volume_ratio"],
+        amount_ratio_20=period_metrics[20]["amount_ratio"],
+        volume_ratio_20=period_metrics[20]["volume_ratio"],
         day_change_pct=day_change_pct,
         close_position=close_position,
         upper_shadow_pct=upper_shadow_pct,
-        turnover_ratio=turnover_ratio,
         main_net_inflow_ratio=main_net_inflow_ratio,
-        min_volume_ratio=min_volume_ratio,
     )
     explanation = []
+    for window in MULTI_PERIOD_WINDOWS:
+        volume_ratio_value = period_metrics[window]["volume_ratio"]
+        amount_ratio_value = period_metrics[window]["amount_ratio"]
+        if volume_ratio_value is not None:
+            explanation.append(f"{window}日成交量量比={round(volume_ratio_value, 2)}")
+        if amount_ratio_value is not None:
+            explanation.append(f"{window}日成交额量比={round(amount_ratio_value, 2)}")
+    if main_ratio is not None:
+        main_ratio_text = f"主判断量比={round(main_ratio, 2)}"
+        if main_ratio_source:
+            main_ratio_text += f"({main_ratio_source})"
+        explanation.append(main_ratio_text)
     if volume_ratio is not None:
         explanation.append(f"量比{volume_window}日均量={round(volume_ratio, 2)}")
     if amount_ratio is not None:
@@ -477,23 +580,42 @@ def analyze_volume_signal(
         "最新最低价": round_or_none(current_low),
         "最新收盘价": round_or_none(current_close),
         "最新涨跌幅%": round_or_none(day_change_pct),
+        "今日涨跌幅%": round_or_none(day_change_pct),
         "成交量(手)": round_or_none(current_volume, 0),
+        "5日均成交量": round_or_none(period_metrics[5]["volume_ma"], 0),
+        "10日均成交量": round_or_none(period_metrics[10]["volume_ma"], 0),
+        "20日均成交量": round_or_none(period_metrics[20]["volume_ma"], 0),
+        "5日成交量量比": round_or_none(period_metrics[5]["volume_ratio"]),
+        "10日成交量量比": round_or_none(period_metrics[10]["volume_ratio"]),
+        "20日成交量量比": round_or_none(period_metrics[20]["volume_ratio"]),
         f"{volume_window}日均量(手)": round_or_none(volume_ma, 0),
         f"量比{volume_window}日均量": round_or_none(volume_ratio),
         "成交额(亿)": round_or_none(None if current_amount is None else current_amount / 100_000_000),
+        "5日均成交额(亿)": round_or_none(None if period_metrics[5]["amount_ma"] is None else period_metrics[5]["amount_ma"] / 100_000_000),
+        "10日均成交额(亿)": round_or_none(None if period_metrics[10]["amount_ma"] is None else period_metrics[10]["amount_ma"] / 100_000_000),
+        "20日均成交额(亿)": round_or_none(None if period_metrics[20]["amount_ma"] is None else period_metrics[20]["amount_ma"] / 100_000_000),
+        "5日成交额量比": round_or_none(period_metrics[5]["amount_ratio"]),
+        "10日成交额量比": round_or_none(period_metrics[10]["amount_ratio"]),
+        "20日成交额量比": round_or_none(period_metrics[20]["amount_ratio"]),
         f"{volume_window}日均成交额(亿)": round_or_none(None if amount_ma is None else amount_ma / 100_000_000),
         f"成交额量比{volume_window}日均额": round_or_none(amount_ratio),
         "换手率%": round_or_none(current_turnover),
         f"{volume_window}日均换手率%": round_or_none(turnover_ma),
         f"换手率比{volume_window}日均换手率": round_or_none(turnover_ratio),
+        "主判断量比": round_or_none(main_ratio),
+        "主判断量比来源": main_ratio_source,
         "收盘位置": round_or_none(close_position),
+        "收盘位置解读": close_position_label,
         "上影线比例%": round_or_none(upper_shadow_pct),
+        "上影线解读": upper_shadow_label,
         "主力净流入(亿)": round_or_none(None if main_net_inflow_yuan is None else main_net_inflow_yuan / 100_000_000),
         "主力净流入占成交额%": round_or_none(main_net_inflow_ratio),
+        "主力资金解读": main_flow_label,
         "成交量分位%": round_or_none(volume_pct),
         "换手率分位%": round_or_none(turnover_pct),
         "是否放量": is_expanding,
         "量能结论": signal_label,
+        "多周期量能解读": multi_period_comment,
         "量价结论": volume_price_label,
         "量价解读": volume_price_desc,
         "风险信号": risk_flags,
