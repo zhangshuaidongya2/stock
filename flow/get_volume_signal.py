@@ -272,6 +272,32 @@ def round_or_none(value: Any, digits: int = 2) -> float | None:
     return stock_info_module.round_or_none(value, digits)
 
 
+def wan_to_yuan(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return value * 10_000
+
+
+def yuan_to_yi(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return value / 100_000_000
+
+
+def empty_main_flow_data() -> dict[str, Any]:
+    return {
+        "main_net_inflow_yuan": None,
+        "main_flow_balance_yuan": None,
+        "main_flow_source": None,
+        "main_flow_date_tag": None,
+        "main_flow_period_sums_yuan": {window: None for window in MULTI_PERIOD_WINDOWS},
+        "super_large_net_inflow_yuan": None,
+        "super_large_net_ratio": None,
+        "large_net_inflow_yuan": None,
+        "large_net_ratio": None,
+    }
+
+
 def load_flow_get_stock_info_module() -> ModuleType:
     global _FLOW_GET_STOCK_INFO_MODULE
     if _FLOW_GET_STOCK_INFO_MODULE is not None:
@@ -306,7 +332,8 @@ def load_flow_get_stock_info_module() -> ModuleType:
 def fetch_main_flow_from_flow_get_stock_info(
     code: str,
     analysis_date: datetime,
-) -> tuple[float | None, float | None, str | None, str | None]:
+) -> dict[str, Any]:
+    result = empty_main_flow_data()
     date_tag = analysis_date.strftime("%m%d")
     try:
         module = load_flow_get_stock_info_module()
@@ -318,7 +345,7 @@ def fetch_main_flow_from_flow_get_stock_info(
             f"主力资金字段保持空。原因：{stock_info_module.compact_error(exc)}",
             file=sys.stderr,
         )
-        return None, None, None, None
+        return result
 
     if date_tag not in available_dates:
         print(
@@ -326,8 +353,9 @@ def fetch_main_flow_from_flow_get_stock_info(
             f" {date_tag} 的主力资金快照，主力资金字段保持空。",
             file=sys.stderr,
         )
-        return None, None, None, None
+        return result
 
+    source_path = input_dir / f"{date_tag}.csv"
     stock_df = all_df[all_df["代码"].map(module.normalize_code) == code].copy()
     matched = stock_df[stock_df["日期"].astype(str) == date_tag].copy()
     if matched.empty:
@@ -336,9 +364,25 @@ def fetch_main_flow_from_flow_get_stock_info(
             f" {date_tag} {code} 的主力资金记录，主力资金字段保持空。",
             file=sys.stderr,
         )
-        return None, None, None, None
+        return result
 
     latest_row = matched.sort_values("日期", kind="stable").iloc[-1]
+    raw_latest_row = latest_row
+    try:
+        raw_df = pd.read_csv(source_path, dtype={"代码": str})
+        raw_df["代码"] = raw_df["代码"].map(module.normalize_code)
+        raw_matched = raw_df[raw_df["代码"] == code].copy()
+        if not raw_matched.empty:
+            if "抓取时间" in raw_matched.columns:
+                raw_matched = raw_matched.sort_values("抓取时间", kind="stable")
+            raw_latest_row = raw_matched.iloc[-1]
+    except Exception as exc:  # noqa: BLE001
+        print(
+            "提示：读取原始资金明细失败，超大单/大单字段保持空。"
+            f"原因：{stock_info_module.compact_error(exc)}",
+            file=sys.stderr,
+        )
+
     main_net_inflow_wan = module.round_or_none(latest_row.get("主力净流入(万)"))
     if main_net_inflow_wan is None:
         print(
@@ -346,10 +390,15 @@ def fetch_main_flow_from_flow_get_stock_info(
             f" {date_tag} {code} 的主力净流入为空，主力资金字段保持空。",
             file=sys.stderr,
         )
-        return None, None, None, None
+        return result
 
     target_index = available_dates.index(date_tag)
     selected_dates = set(available_dates[: target_index + 1])
+    selected_date_list = available_dates[: target_index + 1]
+    day_map = {
+        str(row["日期"]): row
+        for _, row in stock_df.sort_values("日期", kind="stable").iterrows()
+    }
     balance_wan = 0.0
     has_balance = False
     for _, row in stock_df[stock_df["日期"].astype(str).isin(selected_dates)].iterrows():
@@ -359,10 +408,42 @@ def fetch_main_flow_from_flow_get_stock_info(
         balance_wan = round(balance_wan + flow_value, 2)
         has_balance = True
 
-    source_path = input_dir / f"{date_tag}.csv"
+    period_sums_yuan: dict[int, float | None] = {}
+    for window in MULTI_PERIOD_WINDOWS:
+        window_dates = selected_date_list[-window:]
+        if len(window_dates) < window:
+            period_sums_yuan[window] = None
+            continue
+
+        window_values: list[float] = []
+        for period_date in window_dates:
+            row = day_map.get(period_date)
+            flow_value = module.round_or_none(None if row is None else row.get("主力净流入(万)"))
+            if flow_value is None:
+                window_values = []
+                break
+            window_values.append(flow_value)
+        period_sums_yuan[window] = sum(window_values) * 10_000 if window_values else None
+
     source_text = f"flow/get_stock_info.py:{module.display_path(source_path)}"
-    balance_yuan = balance_wan * 10_000 if has_balance else None
-    return main_net_inflow_wan * 10_000, balance_yuan, source_text, date_tag
+    result.update(
+        {
+            "main_net_inflow_yuan": wan_to_yuan(main_net_inflow_wan),
+            "main_flow_balance_yuan": wan_to_yuan(balance_wan) if has_balance else None,
+            "main_flow_source": source_text,
+            "main_flow_date_tag": date_tag,
+            "main_flow_period_sums_yuan": period_sums_yuan,
+            "super_large_net_inflow_yuan": wan_to_yuan(
+                module.round_or_none(raw_latest_row.get("超大单净流入(万)"))
+            ),
+            "super_large_net_ratio": module.round_or_none(raw_latest_row.get("超大单净占比%")),
+            "large_net_inflow_yuan": wan_to_yuan(
+                module.round_or_none(raw_latest_row.get("大单净流入(万)"))
+            ),
+            "large_net_ratio": module.round_or_none(raw_latest_row.get("大单净占比%")),
+        }
+    )
+    return result
 
 
 def parse_tencent_quote_time(value: Any) -> datetime | None:
@@ -629,6 +710,112 @@ def classify_main_balance(main_flow_balance_yuan: float | None, main_flow_balanc
     return "区间主力余额中性"
 
 
+def build_data_alignment_status(latest_date: str, main_flow_date_tag: str | None) -> str:
+    if main_flow_date_tag is None:
+        return "缺少主力资金数据"
+    try:
+        price_date_tag = pd.to_datetime(latest_date).strftime("%m%d")
+    except (TypeError, ValueError):
+        return "价格日期无法识别"
+    if price_date_tag == main_flow_date_tag:
+        return "价格日期与主力资金日期一致"
+    return "价格日期与主力资金日期不一致，量价结论需谨慎"
+
+
+def classify_fund_trend(
+    *,
+    main_net_inflow_ratio: float | None,
+    main_flow_balance_yuan: float | None,
+    main_flow_period_sums_yuan: dict[int, float | None],
+    super_large_net_ratio: float | None,
+    large_net_ratio: float | None,
+) -> str | None:
+    available_sums = [
+        value for value in main_flow_period_sums_yuan.values() if value is not None
+    ]
+    if (
+        main_net_inflow_ratio is None
+        and main_flow_balance_yuan is None
+        and not available_sums
+        and super_large_net_ratio is None
+        and large_net_ratio is None
+    ):
+        return None
+
+    negative_periods = sum(1 for value in available_sums if value < 0)
+    positive_periods = sum(1 for value in available_sums if value > 0)
+    all_available_negative = bool(available_sums) and negative_periods == len(available_sums)
+    all_available_positive = bool(available_sums) and positive_periods == len(available_sums)
+
+    if main_net_inflow_ratio is not None and main_net_inflow_ratio <= -8:
+        if all_available_negative:
+            return "当日主力明显流出，且短中期累计也偏流出，资金撤退信号较强。"
+        if main_flow_balance_yuan is not None and main_flow_balance_yuan > 0:
+            return "当日主力明显流出，但区间累计仍为正，偏短线兑现或资金分歧，需要看后续能否回流。"
+        if super_large_net_ratio is not None and super_large_net_ratio <= -5:
+            return "当日主力明显流出且超大单同步流出，主动兑现压力偏大。"
+        return "当日主力明显流出，资金面偏弱。"
+
+    if main_net_inflow_ratio is not None and main_net_inflow_ratio >= 8:
+        if all_available_positive:
+            return "当日主力明显流入，且短中期累计也偏流入，资金承接较强。"
+        if super_large_net_ratio is not None and super_large_net_ratio >= 5:
+            return "当日主力明显流入且超大单同步流入，资金推动偏强。"
+        return "当日主力明显流入，资金面偏强。"
+
+    if all_available_negative and main_flow_balance_yuan is not None and main_flow_balance_yuan < 0:
+        return "短中期累计主力流出且区间余额为负，资金趋势偏弱。"
+    if all_available_positive and main_flow_balance_yuan is not None and main_flow_balance_yuan > 0:
+        return "短中期累计主力流入且区间余额为正，资金趋势偏强。"
+    if super_large_net_ratio is not None and super_large_net_ratio <= -5:
+        return "超大单明显流出，资金结构偏弱。"
+    if super_large_net_ratio is not None and super_large_net_ratio >= 5:
+        return "超大单明显流入，资金结构偏强。"
+    return "资金趋势分化，需要结合后续交易日确认。"
+
+
+def classify_signal_confidence(
+    *,
+    main_ratio: float | None,
+    day_change_pct: float | None,
+    close_position: float | None,
+    upper_shadow_pct: float | None,
+    main_net_inflow_ratio: float | None,
+    main_flow_period_sums_yuan: dict[int, float | None],
+    data_alignment_status: str,
+) -> tuple[str, str]:
+    score = 0
+    missing_reasons: list[str] = []
+
+    if main_ratio is not None:
+        score += 1
+    else:
+        missing_reasons.append("缺少主判断量比")
+    if day_change_pct is not None and close_position is not None and upper_shadow_pct is not None:
+        score += 1
+    else:
+        missing_reasons.append("K线价格字段不完整")
+    if main_net_inflow_ratio is not None:
+        score += 1
+    else:
+        missing_reasons.append("缺少当日主力资金占比")
+    if any(value is not None for value in main_flow_period_sums_yuan.values()):
+        score += 1
+    else:
+        missing_reasons.append("缺少短中期主力累计")
+    if data_alignment_status == "价格日期与主力资金日期一致":
+        score += 1
+    else:
+        missing_reasons.append(data_alignment_status)
+
+    if score >= 5:
+        return "高", "量能、价格、资金和日期对齐信息较完整，多指标结论一致性较好。"
+    if score >= 3:
+        return "中", "核心量价数据可用，但部分资金或日期信息不足，结论需要后续确认。"
+    reason_text = "；".join(missing_reasons[:3]) if missing_reasons else "可用指标较少"
+    return "低", f"{reason_text}，当前结论只能作为弱参考。"
+
+
 def select_primary_ratio(
     period_metrics: dict[int, dict[str, float | None]],
 ) -> tuple[float | None, str | None]:
@@ -678,6 +865,8 @@ def classify_volume_price_signal(
     main_net_inflow_ratio: float | None,
     main_flow_balance_yuan: float | None,
     main_flow_balance_ratio: float | None,
+    super_large_net_ratio: float | None,
+    large_net_ratio: float | None,
 ) -> tuple[str, str, list[str]]:
     risk_flags: list[str] = []
     period_metrics = {
@@ -709,6 +898,14 @@ def classify_volume_price_signal(
         risk_flags.append("区间主力余额明显为负")
     elif main_flow_balance_yuan is not None and main_flow_balance_yuan < 0:
         risk_flags.append("区间主力余额为负")
+    if super_large_net_ratio is not None and super_large_net_ratio <= -5:
+        risk_flags.append("超大单明显流出")
+    elif super_large_net_ratio is not None and super_large_net_ratio <= -3:
+        risk_flags.append("超大单偏流出")
+    if large_net_ratio is not None and large_net_ratio <= -5:
+        risk_flags.append("大单明显流出")
+    elif large_net_ratio is not None and large_net_ratio <= -3:
+        risk_flags.append("大单偏流出")
 
     if (
         main_ratio >= 1.5
@@ -721,9 +918,12 @@ def classify_volume_price_signal(
                 and main_flow_balance_ratio is not None
                 and main_flow_balance_ratio <= -30
             )
+            or (super_large_net_ratio is not None and super_large_net_ratio <= -5)
         )
     ):
         return "疑似高位派发", "疑似高位派发：放量、长上影、主力流出或区间余额偏负同时出现，需警惕资金借高人气兑现。", risk_flags
+    if main_ratio >= 1.2 and day_change_pct >= 3 and main_net_inflow_ratio is not None and main_net_inflow_ratio <= -8:
+        return "放量上涨但主力流出", "放量上涨但主力流出：价格被推高，但主力资金明显流出，需防冲高兑现。", risk_flags
     if main_ratio >= 1.5 and day_change_pct >= 5 and close_position is not None and close_position >= 0.7:
         return "强势放量上涨", "强势放量上涨：成交明显放大，股价大涨且收盘靠近高点，承接较强。", risk_flags
     if main_ratio >= 1.2 and day_change_pct >= 3 and close_position is not None and close_position >= 0.7:
@@ -746,6 +946,11 @@ def analyze_volume_signal(
     min_volume_ratio: float,
     main_net_inflow_yuan: float | None = None,
     main_flow_balance_yuan: float | None = None,
+    main_flow_period_sums_yuan: dict[int, float | None] | None = None,
+    super_large_net_inflow_yuan: float | None = None,
+    super_large_net_ratio: float | None = None,
+    large_net_inflow_yuan: float | None = None,
+    large_net_ratio: float | None = None,
     main_flow_source: str | None = None,
     main_flow_date_tag: str | None = None,
 ) -> dict[str, Any]:
@@ -755,6 +960,9 @@ def analyze_volume_signal(
         raise SystemExit("历史行情缺少字段：" + "、".join(sorted(missing)))
 
     df = hist_df.copy()
+    main_flow_period_sums_yuan = main_flow_period_sums_yuan or {
+        window: None for window in MULTI_PERIOD_WINDOWS
+    }
     for column in ["开盘", "最高", "最低", "收盘", "成交量", "成交额", "换手率"]:
         if column in df.columns:
             df[column] = pd.to_numeric(df[column], errors="coerce")
@@ -837,6 +1045,23 @@ def analyze_volume_signal(
     upper_shadow_label = classify_upper_shadow(upper_shadow_pct)
     main_flow_label = classify_main_flow(main_net_inflow_ratio)
     main_balance_label = classify_main_balance(main_flow_balance_yuan, main_flow_balance_ratio)
+    data_alignment_status = build_data_alignment_status(latest_date, main_flow_date_tag)
+    fund_trend_comment = classify_fund_trend(
+        main_net_inflow_ratio=main_net_inflow_ratio,
+        main_flow_balance_yuan=main_flow_balance_yuan,
+        main_flow_period_sums_yuan=main_flow_period_sums_yuan,
+        super_large_net_ratio=super_large_net_ratio,
+        large_net_ratio=large_net_ratio,
+    )
+    confidence_label, confidence_desc = classify_signal_confidence(
+        main_ratio=main_ratio,
+        day_change_pct=day_change_pct,
+        close_position=close_position,
+        upper_shadow_pct=upper_shadow_pct,
+        main_net_inflow_ratio=main_net_inflow_ratio,
+        main_flow_period_sums_yuan=main_flow_period_sums_yuan,
+        data_alignment_status=data_alignment_status,
+    )
     multi_period_comment = build_multi_period_volume_comment(period_metrics)
     volume_price_label, volume_price_desc, risk_flags = classify_volume_price_signal(
         amount_ratio_10=period_metrics[10]["amount_ratio"],
@@ -849,6 +1074,8 @@ def analyze_volume_signal(
         main_net_inflow_ratio=main_net_inflow_ratio,
         main_flow_balance_yuan=main_flow_balance_yuan,
         main_flow_balance_ratio=main_flow_balance_ratio,
+        super_large_net_ratio=super_large_net_ratio,
+        large_net_ratio=large_net_ratio,
     )
     explanation = []
     for window in MULTI_PERIOD_WINDOWS:
@@ -875,6 +1102,10 @@ def analyze_volume_signal(
         explanation.append(f"成交量分位={round(volume_pct, 2)}%")
     if turnover_pct is not None:
         explanation.append(f"换手率分位={round(turnover_pct, 2)}%")
+    if main_net_inflow_ratio is not None:
+        explanation.append(f"主力净流入占成交额={round(main_net_inflow_ratio, 2)}%")
+    if main_flow_balance_ratio is not None:
+        explanation.append(f"区间主力累计占成交额={round(main_flow_balance_ratio, 2)}%")
 
     return {
         "分析日期": latest_date,
@@ -894,13 +1125,13 @@ def analyze_volume_signal(
         f"{volume_window}日均量(手)": round_or_none(volume_ma, 0),
         f"量比{volume_window}日均量": round_or_none(volume_ratio),
         "成交额(亿)": round_or_none(None if current_amount is None else current_amount / 100_000_000),
-        "5日均成交额(亿)": round_or_none(None if period_metrics[5]["amount_ma"] is None else period_metrics[5]["amount_ma"] / 100_000_000),
-        "10日均成交额(亿)": round_or_none(None if period_metrics[10]["amount_ma"] is None else period_metrics[10]["amount_ma"] / 100_000_000),
-        "20日均成交额(亿)": round_or_none(None if period_metrics[20]["amount_ma"] is None else period_metrics[20]["amount_ma"] / 100_000_000),
+        "5日均成交额(亿)": round_or_none(yuan_to_yi(period_metrics[5]["amount_ma"])),
+        "10日均成交额(亿)": round_or_none(yuan_to_yi(period_metrics[10]["amount_ma"])),
+        "20日均成交额(亿)": round_or_none(yuan_to_yi(period_metrics[20]["amount_ma"])),
         "5日成交额量比": round_or_none(period_metrics[5]["amount_ratio"]),
         "10日成交额量比": round_or_none(period_metrics[10]["amount_ratio"]),
         "20日成交额量比": round_or_none(period_metrics[20]["amount_ratio"]),
-        f"{volume_window}日均成交额(亿)": round_or_none(None if amount_ma is None else amount_ma / 100_000_000),
+        f"{volume_window}日均成交额(亿)": round_or_none(yuan_to_yi(amount_ma)),
         f"成交额量比{volume_window}日均额": round_or_none(amount_ratio),
         "换手率%": round_or_none(current_turnover),
         f"{volume_window}日均换手率%": round_or_none(turnover_ma),
@@ -911,14 +1142,24 @@ def analyze_volume_signal(
         "收盘位置解读": close_position_label,
         "上影线比例%": round_or_none(upper_shadow_pct),
         "上影线解读": upper_shadow_label,
-        "主力净流入(亿)": round_or_none(None if main_net_inflow_yuan is None else main_net_inflow_yuan / 100_000_000),
+        "主力净流入(亿)": round_or_none(yuan_to_yi(main_net_inflow_yuan)),
         "主力净流入占成交额%": round_or_none(main_net_inflow_ratio),
         "主力资金解读": main_flow_label,
-        "主力资金余额(亿)": round_or_none(None if main_flow_balance_yuan is None else main_flow_balance_yuan / 100_000_000),
+        "主力资金余额(亿)": round_or_none(yuan_to_yi(main_flow_balance_yuan)),
+        "区间主力净流入累计(亿)": round_or_none(yuan_to_yi(main_flow_balance_yuan)),
         "主力资金余额占成交额%": round_or_none(main_flow_balance_ratio),
         "主力余额解读": main_balance_label,
+        "5日主力净流入合计(亿)": round_or_none(yuan_to_yi(main_flow_period_sums_yuan.get(5))),
+        "10日主力净流入合计(亿)": round_or_none(yuan_to_yi(main_flow_period_sums_yuan.get(10))),
+        "20日主力净流入合计(亿)": round_or_none(yuan_to_yi(main_flow_period_sums_yuan.get(20))),
+        "超大单净流入(亿)": round_or_none(yuan_to_yi(super_large_net_inflow_yuan)),
+        "超大单净占比%": round_or_none(super_large_net_ratio),
+        "大单净流入(亿)": round_or_none(yuan_to_yi(large_net_inflow_yuan)),
+        "大单净占比%": round_or_none(large_net_ratio),
+        "资金趋势解读": fund_trend_comment,
         "主力资金数据源": main_flow_source,
         "主力资金日期": main_flow_date_tag,
+        "数据对齐状态": data_alignment_status,
         "成交量分位%": round_or_none(volume_pct),
         "换手率分位%": round_or_none(turnover_pct),
         "是否放量": is_expanding,
@@ -926,6 +1167,8 @@ def analyze_volume_signal(
         "多周期量能解读": multi_period_comment,
         "量价结论": volume_price_label,
         "量价解读": volume_price_desc,
+        "结论可信度": confidence_label,
+        "可信度说明": confidence_desc,
         "风险信号": risk_flags,
         "量能说明": "；".join(explanation) if explanation else None,
     }
@@ -1002,36 +1245,39 @@ def main() -> None:
         name=name,
         target_date=target_date,
     )
-    main_net_inflow_yuan = args.main_net_inflow_yuan
-    main_flow_balance_yuan = None
-    main_flow_source = None
-    main_flow_date_tag = None
-    if args.main_net_inflow_yuan is not None:
-        main_flow_source = "手动参数 --main-net-inflow-yuan"
-    if args.main_net_inflow_yi is not None:
-        main_net_inflow_yuan = args.main_net_inflow_yi * 100_000_000
-        main_flow_source = "手动参数 --main-net-inflow-yi"
+    analysis_datetime = get_latest_analysis_datetime(hist_df)
+    main_flow_data = fetch_main_flow_from_flow_get_stock_info(code, analysis_datetime)
 
-    if main_net_inflow_yuan is None:
-        analysis_datetime = get_latest_analysis_datetime(hist_df)
-        (
-            main_net_inflow_yuan,
-            main_flow_balance_yuan,
-            main_flow_source,
-            main_flow_date_tag,
-        ) = fetch_main_flow_from_flow_get_stock_info(
-            code,
-            analysis_datetime,
+    manual_main_flow_source = None
+    manual_main_net_inflow_yuan = args.main_net_inflow_yuan
+    if args.main_net_inflow_yuan is not None:
+        manual_main_flow_source = "手动参数 --main-net-inflow-yuan"
+    if args.main_net_inflow_yi is not None:
+        manual_main_net_inflow_yuan = args.main_net_inflow_yi * 100_000_000
+        manual_main_flow_source = "手动参数 --main-net-inflow-yi"
+
+    if manual_main_flow_source is not None:
+        auto_source = main_flow_data.get("main_flow_source")
+        main_flow_data["main_net_inflow_yuan"] = manual_main_net_inflow_yuan
+        main_flow_data["main_flow_source"] = (
+            f"{manual_main_flow_source}; 余额/周期来自 {auto_source}"
+            if auto_source
+            else manual_main_flow_source
         )
 
     signal = analyze_volume_signal(
         hist_df,
         volume_window=args.volume_window,
         min_volume_ratio=args.min_volume_ratio,
-        main_net_inflow_yuan=main_net_inflow_yuan,
-        main_flow_balance_yuan=main_flow_balance_yuan,
-        main_flow_source=main_flow_source,
-        main_flow_date_tag=main_flow_date_tag,
+        main_net_inflow_yuan=main_flow_data.get("main_net_inflow_yuan"),
+        main_flow_balance_yuan=main_flow_data.get("main_flow_balance_yuan"),
+        main_flow_period_sums_yuan=main_flow_data.get("main_flow_period_sums_yuan"),
+        super_large_net_inflow_yuan=main_flow_data.get("super_large_net_inflow_yuan"),
+        super_large_net_ratio=main_flow_data.get("super_large_net_ratio"),
+        large_net_inflow_yuan=main_flow_data.get("large_net_inflow_yuan"),
+        large_net_ratio=main_flow_data.get("large_net_ratio"),
+        main_flow_source=main_flow_data.get("main_flow_source"),
+        main_flow_date_tag=main_flow_data.get("main_flow_date_tag"),
     )
     output_path = Path(args.output) if args.output else None
     result = build_result(
