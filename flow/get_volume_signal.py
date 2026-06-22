@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +40,9 @@ DEFAULT_VOLUME_WINDOW = 20
 DEFAULT_MIN_VOLUME_RATIO = 1.2
 DEFAULT_HISTORY_SOURCE = "sina"
 DEFAULT_ADJUST = "qfq"
+DEFAULT_QUOTE_SOURCE = "tencent"
 MULTI_PERIOD_WINDOWS = (5, 10, 20)
+CHINA_TZ = timezone(timedelta(hours=8))
 
 
 def parse_args() -> argparse.Namespace:
@@ -116,6 +118,10 @@ def parse_target_date(value: str) -> datetime:
         return datetime.strptime(digits, "%Y%m%d")
     except ValueError as exc:
         raise SystemExit(f"无法解析日期：{value}") from exc
+
+
+def china_now() -> datetime:
+    return datetime.now(CHINA_TZ)
 
 
 def resolve_unique_symbol_match(
@@ -194,7 +200,7 @@ def fetch_history_df(
     source: str,
     target_date: datetime | None = None,
 ) -> tuple[pd.DataFrame, str]:
-    end_dt = target_date or datetime.now()
+    end_dt = target_date or china_now()
     end_date = end_dt.strftime("%Y%m%d")
     start_date = (end_dt - timedelta(days=max(40, days * 3))).strftime("%Y%m%d")
     errors: list[str] = []
@@ -260,6 +266,162 @@ def safe_float(value: Any) -> float | None:
 
 def round_or_none(value: Any, digits: int = 2) -> float | None:
     return stock_info_module.round_or_none(value, digits)
+
+
+def parse_tencent_quote_time(value: Any) -> datetime | None:
+    digits = "".join(ch for ch in str(value).strip() if ch.isdigit())
+    if len(digits) != 14:
+        return None
+    try:
+        return datetime.strptime(digits, "%Y%m%d%H%M%S").replace(tzinfo=CHINA_TZ)
+    except ValueError:
+        return None
+
+
+def fetch_tencent_realtime_row(code: str, fallback_name: str) -> tuple[dict[str, Any], datetime | None]:
+    import requests
+
+    response = requests.get(
+        "https://qt.gtimg.cn/q=" + stock_info_module.to_tencent_symbol(code),
+        timeout=stock_info_module.REQUEST_TIMEOUT,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    response.raise_for_status()
+    text = response.content.decode("gbk", errors="ignore")
+    if '="' not in text:
+        raise RuntimeError("腾讯返回格式异常")
+    payload = text.split('="', 1)[1].rsplit('"', 1)[0]
+    parts = payload.split("~")
+    if len(parts) < 58 or not parts[2]:
+        raise RuntimeError("腾讯未返回可解析行情")
+
+    amount_raw = safe_float(parts[57])
+    return (
+        {
+            "代码": normalize_code(parts[2]),
+            "名称": str(parts[1]).strip() or fallback_name,
+            "最新价": safe_float(parts[3]),
+            "涨跌幅": safe_float(parts[32]),
+            "成交量": safe_float(parts[36]),
+            "成交额": amount_raw * 10_000 if amount_raw is not None else None,
+            "最高": safe_float(parts[33]),
+            "最低": safe_float(parts[34]),
+            "今开": safe_float(parts[5]),
+            "昨收": safe_float(parts[4]),
+            "换手率": safe_float(parts[38]),
+            "行情来源": "腾讯",
+        },
+        parse_tencent_quote_time(parts[30]),
+    )
+
+
+def is_usable_realtime_row(row: dict[str, Any]) -> bool:
+    latest_price = safe_float(row.get("最新价"))
+    previous_close = safe_float(row.get("昨收"))
+    volume = safe_float(row.get("成交量"))
+    amount = safe_float(row.get("成交额"))
+    if latest_price in (None, 0):
+        return False
+    if volume is not None and volume > 0:
+        return True
+    if amount is not None and amount > 0:
+        return True
+    if previous_close in (None, 0):
+        return False
+    for field in ("今开", "最高", "最低", "最新价"):
+        field_value = safe_float(row.get(field))
+        if field_value is not None and abs(field_value - previous_close) > 1e-9:
+            return True
+    return False
+
+
+def build_realtime_history_row(
+    code: str,
+    realtime_row: dict[str, Any],
+    quote_time: datetime,
+) -> dict[str, Any]:
+    return {
+        "日期": quote_time.strftime("%Y-%m-%d"),
+        "股票代码": code,
+        "开盘": safe_float(realtime_row.get("今开")),
+        "收盘": safe_float(realtime_row.get("最新价")),
+        "最高": safe_float(realtime_row.get("最高")),
+        "最低": safe_float(realtime_row.get("最低")),
+        "成交量": safe_float(realtime_row.get("成交量")),
+        "成交额": safe_float(realtime_row.get("成交额")),
+        "换手率": safe_float(realtime_row.get("换手率")),
+    }
+
+
+def merge_realtime_row_into_history(
+    hist_df: pd.DataFrame,
+    realtime_row: dict[str, Any],
+    quote_time: datetime,
+    code: str,
+) -> pd.DataFrame:
+    merged_df = hist_df.copy()
+    merged_df["日期"] = pd.to_datetime(merged_df["日期"], errors="coerce")
+    realtime_date = pd.Timestamp(quote_time.date())
+    realtime_history_row = build_realtime_history_row(code, realtime_row, quote_time)
+    realtime_df = pd.DataFrame([realtime_history_row])
+    realtime_df["日期"] = pd.to_datetime(realtime_df["日期"], errors="coerce")
+
+    merged_df = merged_df.loc[merged_df["日期"] != realtime_date].copy()
+    merged_df = pd.concat([merged_df, realtime_df], ignore_index=True)
+    merged_df = merged_df.sort_values("日期").copy()
+    merged_df["日期"] = merged_df["日期"].dt.strftime("%Y-%m-%d")
+    return merged_df
+
+
+def maybe_attach_realtime_row(
+    hist_df: pd.DataFrame,
+    *,
+    code: str,
+    name: str,
+    target_date: datetime | None,
+) -> tuple[pd.DataFrame, str, str | None, str | None]:
+    if target_date is not None:
+        return hist_df, "历史日线", None, None
+
+    try:
+        realtime_row, quote_time = fetch_tencent_realtime_row(code, name)
+    except Exception as exc:  # noqa: BLE001
+        print(
+            "提示：未拿到当天实时行情，已回退到历史日线。"
+            f"原因：{stock_info_module.compact_error(exc)}",
+            file=sys.stderr,
+        )
+        return hist_df, "历史日线回退", None, None
+
+    if quote_time is None:
+        print("提示：实时行情缺少更新时间，已回退到历史日线。", file=sys.stderr)
+        return hist_df, "历史日线回退", None, None
+
+    if quote_time.date() != china_now().date():
+        print(
+            "提示：实时行情未更新到今天，已回退到历史日线。"
+            f"实时时间：{quote_time.strftime('%Y-%m-%d %H:%M:%S')}",
+            file=sys.stderr,
+        )
+        return hist_df, "历史日线回退", None, None
+
+    if not is_usable_realtime_row(realtime_row):
+        print("提示：当天实时行情关键字段不足，已回退到历史日线。", file=sys.stderr)
+        return hist_df, "历史日线回退", None, None
+
+    merged_df = merge_realtime_row_into_history(hist_df, realtime_row, quote_time, code)
+    print(
+        "提示：已优先使用当天实时行情参与分析。"
+        f" 实时来源：{realtime_row.get('行情来源', DEFAULT_QUOTE_SOURCE)}"
+        f" 时间：{quote_time.strftime('%Y-%m-%d %H:%M:%S')}",
+        file=sys.stderr,
+    )
+    return (
+        merged_df,
+        "实时行情+历史日线",
+        str(realtime_row.get("行情来源", DEFAULT_QUOTE_SOURCE)),
+        quote_time.isoformat(timespec="seconds"),
+    )
 
 
 def calculate_shifted_average_ratio(
@@ -628,6 +790,9 @@ def build_result(
     code: str,
     name: str,
     history_source: str,
+    analysis_mode: str,
+    realtime_source: str | None,
+    realtime_time: str | None,
     target_date: str | None,
     history_days: int,
     volume_window: int,
@@ -638,9 +803,14 @@ def build_result(
         "历史回看天数": history_days,
         "均量窗口": volume_window,
         "放量阈值": round_or_none(min_volume_ratio),
+        "分析数据模式": analysis_mode,
     }
     if target_date is not None:
         analysis_params["目标日期"] = target_date
+    if realtime_source is not None:
+        analysis_params["实时行情来源"] = realtime_source
+    if realtime_time is not None:
+        analysis_params["实时行情时间"] = realtime_time
     return {
         "代码": code,
         "名称": name,
@@ -680,6 +850,12 @@ def main() -> None:
         args.history_source,
         target_date=target_date,
     )
+    hist_df, analysis_mode, realtime_source, realtime_time = maybe_attach_realtime_row(
+        hist_df,
+        code=code,
+        name=name,
+        target_date=target_date,
+    )
     main_net_inflow_yuan = args.main_net_inflow_yuan
     if args.main_net_inflow_yi is not None:
         main_net_inflow_yuan = args.main_net_inflow_yi * 100_000_000
@@ -695,6 +871,9 @@ def main() -> None:
         code=code,
         name=name,
         history_source=history_source,
+        analysis_mode=analysis_mode,
+        realtime_source=realtime_source,
+        realtime_time=realtime_time,
         target_date=target_date.strftime("%Y-%m-%d") if target_date is not None else None,
         history_days=args.history_days,
         volume_window=args.volume_window,
