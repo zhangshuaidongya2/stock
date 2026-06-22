@@ -12,9 +12,11 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 from datetime import datetime, timedelta, timezone
+from types import ModuleType
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,7 @@ from symbol_search import (
 
 
 SYMBOL_CACHE_PATH = PROJECT_DIR / "stock_symbols_full_cache.json"
+FLOW_DIR = Path(__file__).resolve().parent
 DEFAULT_HISTORY_DAYS = 120
 DEFAULT_VOLUME_WINDOW = 20
 DEFAULT_MIN_VOLUME_RATIO = 1.2
@@ -43,6 +46,7 @@ DEFAULT_ADJUST = "qfq"
 DEFAULT_QUOTE_SOURCE = "tencent"
 MULTI_PERIOD_WINDOWS = (5, 10, 20)
 CHINA_TZ = timezone(timedelta(hours=8))
+_FLOW_GET_STOCK_INFO_MODULE: ModuleType | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -268,6 +272,99 @@ def round_or_none(value: Any, digits: int = 2) -> float | None:
     return stock_info_module.round_or_none(value, digits)
 
 
+def load_flow_get_stock_info_module() -> ModuleType:
+    global _FLOW_GET_STOCK_INFO_MODULE
+    if _FLOW_GET_STOCK_INFO_MODULE is not None:
+        return _FLOW_GET_STOCK_INFO_MODULE
+
+    module_path = FLOW_DIR / "get_stock_info.py"
+    if not module_path.exists():
+        raise RuntimeError(f"未找到数据源脚本：{module_path}")
+
+    spec = importlib.util.spec_from_file_location("_flow_get_stock_info", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"无法加载数据源脚本：{module_path}")
+
+    inserted = False
+    if str(FLOW_DIR) not in sys.path:
+        sys.path.insert(0, str(FLOW_DIR))
+        inserted = True
+    try:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(str(FLOW_DIR))
+            except ValueError:
+                pass
+
+    _FLOW_GET_STOCK_INFO_MODULE = module
+    return module
+
+
+def fetch_main_flow_from_flow_get_stock_info(
+    code: str,
+    analysis_date: datetime,
+) -> tuple[float | None, float | None, str | None, str | None]:
+    date_tag = analysis_date.strftime("%m%d")
+    try:
+        module = load_flow_get_stock_info_module()
+        input_dir = module.resolve_project_path(module.TODAY_DATA_DIR)
+        available_dates, all_df = module.read_all_snapshots(input_dir)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
+        print(
+            "提示：未能从 flow/get_stock_info.py 数据源读取主力资金，"
+            f"主力资金字段保持空。原因：{stock_info_module.compact_error(exc)}",
+            file=sys.stderr,
+        )
+        return None, None, None, None
+
+    if date_tag not in available_dates:
+        print(
+            "提示：flow/get_stock_info.py 数据源没有"
+            f" {date_tag} 的主力资金快照，主力资金字段保持空。",
+            file=sys.stderr,
+        )
+        return None, None, None, None
+
+    stock_df = all_df[all_df["代码"].map(module.normalize_code) == code].copy()
+    matched = stock_df[stock_df["日期"].astype(str) == date_tag].copy()
+    if matched.empty:
+        print(
+            "提示：flow/get_stock_info.py 数据源中没有"
+            f" {date_tag} {code} 的主力资金记录，主力资金字段保持空。",
+            file=sys.stderr,
+        )
+        return None, None, None, None
+
+    latest_row = matched.sort_values("日期", kind="stable").iloc[-1]
+    main_net_inflow_wan = module.round_or_none(latest_row.get("主力净流入(万)"))
+    if main_net_inflow_wan is None:
+        print(
+            "提示：flow/get_stock_info.py 数据源中"
+            f" {date_tag} {code} 的主力净流入为空，主力资金字段保持空。",
+            file=sys.stderr,
+        )
+        return None, None, None, None
+
+    target_index = available_dates.index(date_tag)
+    selected_dates = set(available_dates[: target_index + 1])
+    balance_wan = 0.0
+    has_balance = False
+    for _, row in stock_df[stock_df["日期"].astype(str).isin(selected_dates)].iterrows():
+        flow_value = module.round_or_none(row.get("主力净流入(万)"))
+        if flow_value is None:
+            continue
+        balance_wan = round(balance_wan + flow_value, 2)
+        has_balance = True
+
+    source_path = input_dir / f"{date_tag}.csv"
+    source_text = f"flow/get_stock_info.py:{module.display_path(source_path)}"
+    balance_yuan = balance_wan * 10_000 if has_balance else None
+    return main_net_inflow_wan * 10_000, balance_yuan, source_text, date_tag
+
+
 def parse_tencent_quote_time(value: Any) -> datetime | None:
     digits = "".join(ch for ch in str(value).strip() if ch.isdigit())
     if len(digits) != 14:
@@ -371,6 +468,15 @@ def merge_realtime_row_into_history(
     merged_df = merged_df.sort_values("日期").copy()
     merged_df["日期"] = merged_df["日期"].dt.strftime("%Y-%m-%d")
     return merged_df
+
+
+def get_latest_analysis_datetime(hist_df: pd.DataFrame) -> datetime:
+    if "日期" not in hist_df.columns or hist_df.empty:
+        return china_now()
+    latest_date = pd.to_datetime(hist_df["日期"], errors="coerce").dropna()
+    if latest_date.empty:
+        return china_now()
+    return latest_date.iloc[-1].to_pydatetime()
 
 
 def maybe_attach_realtime_row(
@@ -509,6 +615,20 @@ def classify_main_flow(main_net_inflow_ratio: float | None) -> str | None:
     return "主力明显流入"
 
 
+def classify_main_balance(main_flow_balance_yuan: float | None, main_flow_balance_ratio: float | None) -> str | None:
+    if main_flow_balance_yuan is None:
+        return None
+    if main_flow_balance_yuan < 0:
+        if main_flow_balance_ratio is not None and main_flow_balance_ratio <= -30:
+            return "区间主力余额明显为负"
+        return "区间主力余额为负"
+    if main_flow_balance_yuan > 0:
+        if main_flow_balance_ratio is not None and main_flow_balance_ratio >= 30:
+            return "区间主力余额明显为正"
+        return "区间主力余额为正"
+    return "区间主力余额中性"
+
+
 def select_primary_ratio(
     period_metrics: dict[int, dict[str, float | None]],
 ) -> tuple[float | None, str | None]:
@@ -556,6 +676,8 @@ def classify_volume_price_signal(
     close_position: float | None,
     upper_shadow_pct: float | None,
     main_net_inflow_ratio: float | None,
+    main_flow_balance_yuan: float | None,
+    main_flow_balance_ratio: float | None,
 ) -> tuple[str, str, list[str]]:
     risk_flags: list[str] = []
     period_metrics = {
@@ -583,15 +705,25 @@ def classify_volume_price_signal(
         risk_flags.append("主力资金流出压力很重")
     elif main_net_inflow_ratio is not None and main_net_inflow_ratio <= -8:
         risk_flags.append("主力资金明显流出")
+    if main_flow_balance_ratio is not None and main_flow_balance_ratio <= -30:
+        risk_flags.append("区间主力余额明显为负")
+    elif main_flow_balance_yuan is not None and main_flow_balance_yuan < 0:
+        risk_flags.append("区间主力余额为负")
 
     if (
         main_ratio >= 1.5
         and upper_shadow_pct is not None
         and upper_shadow_pct >= 3
-        and main_net_inflow_ratio is not None
-        and main_net_inflow_ratio <= -8
+        and (
+            (main_net_inflow_ratio is not None and main_net_inflow_ratio <= -8)
+            or (
+                main_net_inflow_ratio is None
+                and main_flow_balance_ratio is not None
+                and main_flow_balance_ratio <= -30
+            )
+        )
     ):
-        return "疑似高位派发", "疑似高位派发：放量、长上影、主力明显流出同时出现，需警惕资金借高人气兑现。", risk_flags
+        return "疑似高位派发", "疑似高位派发：放量、长上影、主力流出或区间余额偏负同时出现，需警惕资金借高人气兑现。", risk_flags
     if main_ratio >= 1.5 and day_change_pct >= 5 and close_position is not None and close_position >= 0.7:
         return "强势放量上涨", "强势放量上涨：成交明显放大，股价大涨且收盘靠近高点，承接较强。", risk_flags
     if main_ratio >= 1.2 and day_change_pct >= 3 and close_position is not None and close_position >= 0.7:
@@ -613,6 +745,9 @@ def analyze_volume_signal(
     volume_window: int,
     min_volume_ratio: float,
     main_net_inflow_yuan: float | None = None,
+    main_flow_balance_yuan: float | None = None,
+    main_flow_source: str | None = None,
+    main_flow_date_tag: str | None = None,
 ) -> dict[str, Any]:
     required = {"日期", "收盘", "成交量"}
     missing = required - set(hist_df.columns)
@@ -692,12 +827,16 @@ def analyze_volume_signal(
     main_net_inflow_ratio = None
     if main_net_inflow_yuan is not None and current_amount not in (None, 0):
         main_net_inflow_ratio = main_net_inflow_yuan / current_amount * 100
+    main_flow_balance_ratio = None
+    if main_flow_balance_yuan is not None and current_amount not in (None, 0):
+        main_flow_balance_ratio = main_flow_balance_yuan / current_amount * 100
 
     main_ratio, main_ratio_source = select_primary_ratio(period_metrics)
     is_expanding, signal_label = classify_volume_level(main_ratio)
     close_position_label = classify_close_position(close_position)
     upper_shadow_label = classify_upper_shadow(upper_shadow_pct)
     main_flow_label = classify_main_flow(main_net_inflow_ratio)
+    main_balance_label = classify_main_balance(main_flow_balance_yuan, main_flow_balance_ratio)
     multi_period_comment = build_multi_period_volume_comment(period_metrics)
     volume_price_label, volume_price_desc, risk_flags = classify_volume_price_signal(
         amount_ratio_10=period_metrics[10]["amount_ratio"],
@@ -708,6 +847,8 @@ def analyze_volume_signal(
         close_position=close_position,
         upper_shadow_pct=upper_shadow_pct,
         main_net_inflow_ratio=main_net_inflow_ratio,
+        main_flow_balance_yuan=main_flow_balance_yuan,
+        main_flow_balance_ratio=main_flow_balance_ratio,
     )
     explanation = []
     for window in MULTI_PERIOD_WINDOWS:
@@ -773,6 +914,11 @@ def analyze_volume_signal(
         "主力净流入(亿)": round_or_none(None if main_net_inflow_yuan is None else main_net_inflow_yuan / 100_000_000),
         "主力净流入占成交额%": round_or_none(main_net_inflow_ratio),
         "主力资金解读": main_flow_label,
+        "主力资金余额(亿)": round_or_none(None if main_flow_balance_yuan is None else main_flow_balance_yuan / 100_000_000),
+        "主力资金余额占成交额%": round_or_none(main_flow_balance_ratio),
+        "主力余额解读": main_balance_label,
+        "主力资金数据源": main_flow_source,
+        "主力资金日期": main_flow_date_tag,
         "成交量分位%": round_or_none(volume_pct),
         "换手率分位%": round_or_none(turnover_pct),
         "是否放量": is_expanding,
@@ -857,14 +1003,35 @@ def main() -> None:
         target_date=target_date,
     )
     main_net_inflow_yuan = args.main_net_inflow_yuan
+    main_flow_balance_yuan = None
+    main_flow_source = None
+    main_flow_date_tag = None
+    if args.main_net_inflow_yuan is not None:
+        main_flow_source = "手动参数 --main-net-inflow-yuan"
     if args.main_net_inflow_yi is not None:
         main_net_inflow_yuan = args.main_net_inflow_yi * 100_000_000
+        main_flow_source = "手动参数 --main-net-inflow-yi"
+
+    if main_net_inflow_yuan is None:
+        analysis_datetime = get_latest_analysis_datetime(hist_df)
+        (
+            main_net_inflow_yuan,
+            main_flow_balance_yuan,
+            main_flow_source,
+            main_flow_date_tag,
+        ) = fetch_main_flow_from_flow_get_stock_info(
+            code,
+            analysis_datetime,
+        )
 
     signal = analyze_volume_signal(
         hist_df,
         volume_window=args.volume_window,
         min_volume_ratio=args.min_volume_ratio,
         main_net_inflow_yuan=main_net_inflow_yuan,
+        main_flow_balance_yuan=main_flow_balance_yuan,
+        main_flow_source=main_flow_source,
+        main_flow_date_tag=main_flow_date_tag,
     )
     output_path = Path(args.output) if args.output else None
     result = build_result(
