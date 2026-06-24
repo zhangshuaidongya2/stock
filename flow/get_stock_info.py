@@ -348,7 +348,7 @@ def build_result(
             f"{flow_text:<{flow_value_width + gap_width}}"
             f"价格: {price_text:<{price_width + gap_width}}"
             f"当前余额: {current_total_text:<{current_total_width + gap_width}}"
-            f"换手率: {turnover_text:<{turnover_width + gap_width}}"
+            f"换率: {turnover_text:<{turnover_width + gap_width}}"
             f"5日线: {ma5_text:<{ma5_width + gap_width}}"
             f"10日线: {ma10_text:<{ma10_width + gap_width}}"
             f"20日线: {ma20_text}"
