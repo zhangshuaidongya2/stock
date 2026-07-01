@@ -4,6 +4,7 @@
 Examples:
   python flow/rank_inflow.py
   python flow/rank_inflow.py --days 8 --top 20
+  python flow/rank_inflow.py --date 0630 --days 8 --top 20
   python flow/rank_inflow.py --days 8 --bottom 20
 """
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +26,7 @@ from analyze_flow_price import (
     date_columns,
     display_path,
     read_matrix,
-    select_dates,
+    round_or_none,
 )
 
 
@@ -48,7 +50,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--days",
         type=int,
-        help="排行最近多少天的主力净流入合计，默认使用全部可共同分析日期。",
+        help="排行多少天的主力净流入合计；不传则使用截止日期及之前全部可共同分析日期。",
+    )
+    parser.add_argument(
+        "--date",
+        help="窗口截止日期，支持 MMDD、YYYYMMDD、YYYY-MM-DD；不传则使用最新可共同分析日期。",
     )
     count_group = parser.add_mutually_exclusive_group()
     count_group.add_argument(
@@ -130,7 +136,29 @@ def build_daily_flow_price_map(
     }
 
 
-def build_rank_record(row: Any, selected_dates: list[str], days: int) -> dict[str, Any]:
+def build_next_day_change(
+    target_price: Any,
+    next_price: Any,
+) -> tuple[str | None, float | None]:
+    target = amount_to_float(target_price)
+    next_value = amount_to_float(next_price)
+    if target is None or target == 0 or next_value is None:
+        return None, None
+
+    change_pct = round(next_value / target * 100 - 100, 2)
+    if change_pct > 0:
+        return "上涨", change_pct
+    if change_pct < 0:
+        return "下跌", change_pct
+    return "不变", change_pct
+
+
+def build_rank_record(
+    row: Any,
+    selected_dates: list[str],
+    days: int,
+    next_day_prices: dict[str, tuple[str | None, Any, Any]] | None = None,
+) -> dict[str, Any]:
     record = build_record(row, selected_dates, days)
     days_label = f"最近{days}天"
     flow_field = f"{days_label}每日净流入(万)"
@@ -143,6 +171,14 @@ def build_rank_record(row: Any, selected_dates: list[str], days: int) -> dict[st
             price_map,
             selected_dates,
         )
+    if next_day_prices is not None:
+        code = str(row.get("代码", "")).zfill(6)
+        next_date, target_price, next_price = next_day_prices.get(code, (None, None, None))
+        next_day_flag, next_day_change_pct = build_next_day_change(target_price, next_price)
+        record["第二天日期"] = next_date
+        record["第二天价格"] = round_or_none(next_price)
+        record["第二天涨跌"] = next_day_flag
+        record["第二天涨跌幅%"] = next_day_change_pct
     return record
 
 
@@ -153,6 +189,101 @@ def select_all_common_dates(flow_df: Any, price_df: Any) -> list[str]:
     if not common_dates:
         raise SystemExit("flow.csv 和 price.csv 没有可共同分析的日期列。")
     return common_dates
+
+
+def normalize_date_tag(value: str) -> str:
+    raw = str(value).strip()
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) == 4:
+        return digits
+    if len(digits) == 8:
+        try:
+            parsed = datetime.strptime(digits, "%Y%m%d")
+        except ValueError as exc:
+            raise SystemExit(f"无法解析日期：{value}") from exc
+        return parsed.strftime("%m%d")
+    raise SystemExit("--date 必须是 MMDD、YYYYMMDD 或 YYYY-MM-DD，例如 0630 或 2026-06-30")
+
+
+def select_common_dates_until(
+    flow_df: Any,
+    price_df: Any,
+    days: int | None,
+    end_date: str | None,
+) -> list[str]:
+    common_dates = select_all_common_dates(flow_df, price_df)
+    target_date = normalize_date_tag(end_date) if end_date else common_dates[-1]
+    if target_date not in common_dates:
+        raise SystemExit(
+            f"--date={target_date} 不在 flow.csv 和 price.csv 的共同日期列中。"
+            f"当前可用日期：{'、'.join(common_dates)}"
+        )
+
+    end_index = common_dates.index(target_date)
+    if days is None:
+        return common_dates[: end_index + 1]
+
+    start_index = end_index - days + 1
+    if start_index < 0:
+        available_days = end_index + 1
+        raise SystemExit(
+            f"--date={target_date} 往前只有 {available_days} 个可共同分析日期，"
+            f"不足 --days={days}。"
+        )
+    return common_dates[start_index : end_index + 1]
+
+
+def next_price_date(price_df: Any, target_date: str) -> str | None:
+    price_dates = date_columns(price_df)
+    if target_date not in price_dates:
+        return None
+    target_index = price_dates.index(target_date)
+    if target_index + 1 >= len(price_dates):
+        return None
+    return price_dates[target_index + 1]
+
+
+def build_next_day_price_map(
+    price_df: Any,
+    target_date: str,
+    next_date: str | None,
+) -> dict[str, tuple[str | None, Any, Any]]:
+    if next_date is None:
+        return {
+            str(row.get("代码", "")).zfill(6): (None, row.get(target_date), None)
+            for _, row in price_df.iterrows()
+        }
+    return {
+        str(row.get("代码", "")).zfill(6): (
+            next_date,
+            row.get(target_date),
+            row.get(next_date),
+        )
+        for _, row in price_df.iterrows()
+    }
+
+
+def build_next_day_summary(records: list[dict[str, Any]]) -> dict[str, int]:
+    summary = {
+        "可比较个数": 0,
+        "第二天上涨个数": 0,
+        "第二天下跌个数": 0,
+        "第二天不变个数": 0,
+        "缺少第二天价格个数": 0,
+    }
+    for record in records:
+        flag = record.get("第二天涨跌")
+        if flag is None:
+            summary["缺少第二天价格个数"] += 1
+            continue
+        summary["可比较个数"] += 1
+        if flag == "上涨":
+            summary["第二天上涨个数"] += 1
+        elif flag == "下跌":
+            summary["第二天下跌个数"] += 1
+        elif flag == "不变":
+            summary["第二天不变个数"] += 1
+    return summary
 
 
 def main() -> None:
@@ -166,10 +297,11 @@ def main() -> None:
 
     flow_df = read_matrix(Path(args.flow_input))
     price_df = read_matrix(Path(args.price_input))
-    selected_dates = (
-        select_all_common_dates(flow_df, price_df)
-        if args.days is None
-        else select_dates(flow_df, price_df, args.days)
+    selected_dates = select_common_dates_until(
+        flow_df,
+        price_df,
+        args.days,
+        args.date,
     )
     merged_df = build_merged_window(flow_df, price_df, selected_dates)
     working_df = build_working_df(merged_df, selected_dates)
@@ -182,14 +314,28 @@ def main() -> None:
         ascending=bottom,
     )
 
-    records = [build_rank_record(row, selected_dates, days) for _, row in ranked_df.iterrows()]
+    next_day_prices = None
+    next_date = None
+    if args.date:
+        next_date = next_price_date(price_df, selected_dates[-1])
+        next_day_prices = build_next_day_price_map(price_df, selected_dates[-1], next_date)
+
+    records = [
+        build_rank_record(row, selected_dates, days, next_day_prices)
+        for _, row in ranked_df.iterrows()
+    ]
+    limited_records = limit_records(records, limit)
     result = {
         "分析参数": {
             "最近天数": days,
+            "截止日期": selected_dates[-1],
             "返回数量": limit,
         },
-        "结果": limit_records(records, limit),
+        "结果": limited_records,
     }
+    if args.date:
+        result["分析参数"]["第二天日期"] = next_date
+        result["分析参数"]["第二天表现统计"] = build_next_day_summary(limited_records)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
