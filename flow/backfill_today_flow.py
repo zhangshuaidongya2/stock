@@ -40,7 +40,7 @@ SYMBOL_CACHE_PATH = PROJECT_DIR / "stock_symbols_cache.json"
 DEFAULT_DELAY = 0.2
 DEFAULT_PAUSE_EVERY = 0
 DEFAULT_PAUSE_SECONDS = 120
-DEFAULT_WORKERS = 2
+DEFAULT_WORKERS = 8
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
 OUTPUT_COLUMNS = [
@@ -750,7 +750,6 @@ def main() -> None:
             for symbol, needed_dates in pending_work:
                 code = normalize_code(symbol["代码"])
                 name = symbol.get("名称", "")
-                print(f"[排队] 补录 {code} {name} ...", file=sys.stderr)
                 future = executor.submit(
                     fetch_symbol_history_task,
                     symbol,
